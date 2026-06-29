@@ -2233,6 +2233,9 @@ class MainWindow(tk.Tk):
         self.focus_force()
         self._reader     = SerialReader()
         self._reader.port = port
+        # Hub event-id map (H5): override the Arduino↔event mapping before the
+        # models read it, from the hub config or persisted settings.
+        self._apply_event_channels()
         self._models     = {i: ExperimentModel(i)
                             for i in range(1, self.num_boxes + 1)}
         # C6: apply persisted post-bout weight delay to all models.
@@ -2265,6 +2268,32 @@ class MainWindow(tk.Tk):
     # from the hub. Applies the per-instance folder layout and records the
     # flashed Arduino sketch into this instance's settings file.
     # ══════════════════════════════════════════════════════════════════════════
+
+    def _apply_event_channels(self):
+        """Override EXPERIMENT_CHANNELS from the hub config (preferred) or
+        persisted settings, so the Arduino↔event id map is user-configurable."""
+        src = (self._hub_config.get("event_channels")
+               or self._settings["shared"].get("event_channels"))
+        if isinstance(src, dict):
+            for k, v in src.items():
+                try:
+                    eid = int(k)
+                except (ValueError, TypeError):
+                    continue
+                if eid in EXPERIMENT_CHANNELS and isinstance(v, dict):
+                    for kk in ("left_onset", "right_onset",
+                               "left_load", "right_load"):
+                        if kk in v:
+                            try:
+                                EXPERIMENT_CHANNELS[eid][kk] = int(v[kk])
+                            except (ValueError, TypeError):
+                                pass
+        # Persist a hub-provided map into this instance's settings.
+        if isinstance(self._hub_config.get("event_channels"), dict):
+            save_shared_value("event_channels",
+                              self._hub_config["event_channels"])
+            self._settings["shared"]["event_channels"] = \
+                self._hub_config["event_channels"]
 
     def _apply_hub_config(self) -> bool:
         """Apply hub-provided folder/box/sketch config; returns True on success."""
@@ -2811,6 +2840,7 @@ class MainWindow(tk.Tk):
             "its offset is done. (Make cells empty, then bottles, then 50 g.)")
 
         self._offset_done: set = set()
+        self._snap_armed: set = set()    # latched (load_id, stage) ready-to-snap
         self._snap_btns: Dict[tuple, object] = {}
         self._cal_cells: list = []
         self._cal_present_g = 0.5
@@ -2940,7 +2970,9 @@ class MainWindow(tk.Tk):
                               k=kind: self._snap(e, s, lid, k))
                 b.grid(row=r, column=4 + ci * 2, padx=2)
                 self._snap_btns[(exp_id, side, kind)] = b
-                self._cal_lock_buttons.append(b)
+                # NOT added to _cal_lock_buttons: the per-cell snaps are governed
+                # solely by stability + latch in _cal_tick, so the init lockout
+                # can't keep a stable cell's button disabled.
 
             stv = tk.StringVar(value="waiting for stable weight…")
             self._snap_svars[(exp_id, side, "status")] = stv
@@ -3719,18 +3751,18 @@ class MainWindow(tk.Tk):
         return var <= self._cal_var_thresh()
 
     def _cell_stable(self, load_id: int) -> bool:
-        """True when the cell's recent readings span ≥ delay seconds and pass the
-        selected stability metric (variance by default, or gram spread)."""
+        """True when the cell's recent readings pass the selected stability metric
+        (variance by default, or gram spread). Uses the readings inside the delay
+        window, falling back to the last few readings when sampling is sparse so
+        the gate tracks the variance shown on the monitor at any stream rate."""
         delay, _, _ = self._cal_params()
         buf = self._cal_buf.get(int(load_id), [])
-        if len(buf) < 2:
+        if len(buf) < 3:
             return False
         now = buf[-1][0]
         recent = [(t, v) for (t, v) in buf if t >= now - delay * 1000.0]
-        if len(recent) < 2:
-            return False
-        if (recent[-1][0] - recent[0][0]) < delay * 1000.0 * 0.6:
-            return False                       # window not yet long enough
+        if len(recent) < 3:
+            recent = buf[-3:]          # sparse sampling: judge the last few reads
         return self._metric_ok([v for (_, v) in recent])
 
     @staticmethod
@@ -3796,8 +3828,9 @@ class MainWindow(tk.Tk):
         self._cal_canvas.draw_idle()
 
     def _cal_tick(self):
-        """Periodic: redraw monitors, evaluate per-cell stability, enable/disable
-        snap buttons and update status messages."""
+        """Periodic: redraw monitors, evaluate per-cell stability, and LATCH each
+        snap button on once its stage has been stable. Once a stage arms, its
+        button stays alive until that snap is taken (no flicker back to waiting)."""
         if not getattr(self, "_cal_built", False):
             return
         delay, thresh, present_g = self._cal_params()
@@ -3806,17 +3839,25 @@ class MainWindow(tk.Tk):
             self._draw_cal_feed(delay)
         except Exception:
             pass
-        locked = getattr(self, "_cal_locked", False)
+        if not hasattr(self, "_snap_armed"):
+            self._snap_armed = set()
         for (exp_id, side, load_id) in self._cal_cells:
             stable = self._cell_stable(load_id)
+            stage  = "offset" if load_id not in self._offset_done else "gain"
+            key    = (load_id, stage)
+            if stable:
+                self._snap_armed.add(key)      # latch: arm once, stays armed
+            armed = key in self._snap_armed
+
             off_b  = self._snap_btns.get((exp_id, side, "offset"))
             gain_b = self._snap_btns.get((exp_id, side, "gain"))
-            if not locked:
-                if off_b is not None:
-                    off_b.config(state=tk.NORMAL if stable else tk.DISABLED)
-                if gain_b is not None:
-                    ok = stable and (load_id in self._offset_done)
-                    gain_b.config(state=tk.NORMAL if ok else tk.DISABLED)
+            if off_b is not None:
+                off_b.config(state=tk.NORMAL
+                             if (stage == "offset" and armed) else tk.DISABLED)
+            if gain_b is not None:
+                gain_b.config(state=tk.NORMAL
+                              if (stage == "gain" and armed) else tk.DISABLED)
+
             sv = self._snap_svars.get((exp_id, side, "status"))
             if sv is not None:
                 done = []
@@ -3825,12 +3866,13 @@ class MainWindow(tk.Tk):
                 gv = self._snap_svars.get((exp_id, side, "gain"))
                 if gv is not None and gv.get() not in ("—", ""):
                     done.append("gain ✓")
-                if not stable:
-                    tail = "waiting for stable weight…"
-                elif load_id not in self._offset_done:
-                    tail = "stable — snap bottle (offset)"
+                want = "bottle (offset)" if stage == "offset" else "50 g (gain)"
+                if armed:
+                    tail = f"ready — snap {want}"
+                elif stable:
+                    tail = "stabilizing…"
                 else:
-                    tail = "stable — snap 50 g (gain)"
+                    tail = "waiting for stable weight…"
                 sv.set(("  ".join(done) + "   " if done else "") + tail)
         self._cal_job = self.after(500, self._cal_tick)
 
@@ -3917,12 +3959,14 @@ class MainWindow(tk.Tk):
                 f"Run the offset (Snap Bottle) for load ID {load_id} before "
                 f"the gain (Snap 50 g).")
             return
-        # Stability gate: only calibrate once the reading has settled.
-        if not self._cell_stable(load_id):
+        # Stability gate: the stage must have ARMED (been stable at least once).
+        # Once armed the button latches on, so we don't re-block on a momentary
+        # wobble — but a stage that never stabilized can't be snapped.
+        if (load_id, kind) not in getattr(self, "_snap_armed", set()):
             messagebox.showwarning(
-                "Not stable",
-                f"Load ID {load_id} hasn't stabilized yet — wait for the live "
-                f"feed to settle within the stability threshold.")
+                "Not stable yet",
+                f"Load ID {load_id} hasn't stabilized for {kind} yet — wait for "
+                f"the monitor to settle within the stability threshold.")
             return
         # Weight-present guard.
         if not self._weight_present_ok(load_id, kind):
@@ -3936,9 +3980,13 @@ class MainWindow(tk.Tk):
             m = self._models[exp_id]
             if side == "Left":  m.offset_weight_left  = live
             else:               m.offset_weight_right = live
+            # Offset done → the GAIN stage must re-stabilise (with the 50 g on).
+            self._snap_armed.discard((load_id, "offset"))
+            self._snap_armed.discard((load_id, "gain"))
         else:
             self._reader.send(f"w{self._gain_avg_ms()}")   # C4: set window first
             self._reader.send(f"k{ch}g")        # per-channel gain (existing cmd)
+            self._snap_armed.discard((load_id, "gain"))
 
         self._snap_svars[(exp_id, side, kind)].set(
             f"{live:.1f}" if live is not None else "sent")
@@ -3963,9 +4011,10 @@ class MainWindow(tk.Tk):
                     "Run offset on all cells before gain. Missing offset for "
                     f"IDs: {sorted(set(missing))}.")
                 return
-        # Weight-present + stability guard across all cells.
+        # Weight-present + stability guard across all cells (armed or live-stable).
+        armed = getattr(self, "_snap_armed", set())
         for _, _, lid in load_ids:
-            if not self._cell_stable(lid):
+            if (lid, kind) not in armed and not self._cell_stable(lid):
                 messagebox.showwarning(
                     "Not stable",
                     f"Load ID {lid} hasn't stabilized yet. Wait for every cell "
@@ -3984,6 +4033,10 @@ class MainWindow(tk.Tk):
                 m = self._models[exp_id]
                 if side == "Left":  m.offset_weight_left  = live
                 else:               m.offset_weight_right = live
+                self._snap_armed.discard((lid, "offset"))
+                self._snap_armed.discard((lid, "gain"))
+            else:
+                self._snap_armed.discard((lid, "gain"))
             self._snap_svars[(exp_id, side, kind)].set(
                 f"{live:.1f}" if live is not None else "sent")
             self._update_cal_status(exp_id, side)
