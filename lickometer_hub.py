@@ -57,6 +57,21 @@ try:
 except Exception:
     _SERIAL_OK = False
 
+# ── arduino-cli resolution ───────────────────────────────────────────────────
+# Resolve the arduino-cli executable relative to THIS script so it works no
+# matter what the current working directory is when the hub is launched. If a
+# bundled binary is found next to this file it's used directly; otherwise we
+# fall back to the bare name and let the OS search PATH.
+def _resolve_arduino_cli():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in ("arduino-cli.exe", "arduino-cli"):
+        candidate = os.path.join(here, name)
+        if os.path.isfile(candidate):
+            return candidate
+    return "arduino-cli"  # rely on PATH
+
+ARDUINO_CLI = _resolve_arduino_cli()
+
 # ── Theme (matches the GUI) ──────────────────────────────────────────────────
 BG     = "#1C1C1E"
 BG_PNL = "#2C2C2E"
@@ -85,6 +100,19 @@ COMMON_FQBN = [
     "arduino:avr:leonardo",
     "arduino:samd:mkrzero",
 ]
+
+# Default Arduino↔event id map (must match the GUI's EXPERIMENT_CHANNELS). The
+# hub setup page pre-populates these and lets the user override them per box;
+# the chosen map is passed to the GUI in the launch config.
+DEFAULT_EVENT_CHANNELS = {
+    1: {"left_onset": 9,  "right_onset": 8,  "left_load": 1, "right_load": 0},
+    2: {"left_onset": 11, "right_onset": 10, "left_load": 3, "right_load": 2},
+    3: {"left_onset": 13, "right_onset": 12, "left_load": 5, "right_load": 4},
+    4: {"left_onset": 15, "right_onset": 14, "left_load": 7, "right_load": 6},
+}
+_EVT_KEYS = ("left_onset", "right_onset", "left_load", "right_load")
+_EVT_LABELS = {"left_onset": "L lick", "right_onset": "R lick",
+               "left_load": "L load", "right_load": "R load"}
 
 
 def find_ports():
@@ -146,8 +174,57 @@ class Hub(tk.Tk):
                  font=FONT, bg=BG_PNL, fg=FG_MUT, wraplength=520, justify="left"
                  ).pack(side=tk.LEFT, padx=4)
 
-        body = tk.Frame(self, bg=BG)
-        body.pack(fill=tk.BOTH, expand=True, padx=14, pady=10)
+        # ── Activity log pinned to the bottom (always visible) ────────────────
+        # Packed BEFORE the scroll area so it reserves space at the bottom and
+        # can never be pushed off-screen by tall card content.
+        logwrap = tk.Frame(self, bg=BG)
+        logwrap.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=(0, 10))
+
+        # ── Scrollable area holding all the setup cards ───────────────────────
+        scroll_host = tk.Frame(self, bg=BG)
+        scroll_host.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        _canvas = tk.Canvas(scroll_host, bg=BG, highlightthickness=0)
+        _vbar = ttk.Scrollbar(scroll_host, orient=tk.VERTICAL,
+                              command=_canvas.yview)
+        _canvas.configure(yscrollcommand=_vbar.set)
+        _vbar.pack(side=tk.RIGHT, fill=tk.Y)
+        _canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # `body` is the inner frame; every self._card(body, ...) lands here and
+        # scrolls with the canvas.
+        body = tk.Frame(_canvas, bg=BG, padx=14, pady=10)
+        _body_win = _canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def _sync_scrollregion(_e=None):
+            _canvas.configure(scrollregion=_canvas.bbox("all"))
+        body.bind("<Configure>", _sync_scrollregion)
+
+        def _match_width(e):
+            # Keep the inner frame as wide as the canvas so cards fill_X works.
+            _canvas.itemconfigure(_body_win, width=e.width)
+        _canvas.bind("<Configure>", _match_width)
+
+        # Mouse-wheel scrolling, active only while the pointer is over the cards
+        # (so it doesn't hijack the log's own scroll). Handles Win/macOS/Linux.
+        def _on_wheel(e):
+            if e.num == 4:
+                _canvas.yview_scroll(-1, "units")
+            elif e.num == 5:
+                _canvas.yview_scroll(1, "units")
+            else:
+                _canvas.yview_scroll(int(-e.delta / 120), "units")
+        def _wheel_on(_e):
+            _canvas.bind_all("<MouseWheel>", _on_wheel)
+            _canvas.bind_all("<Button-4>", _on_wheel)
+            _canvas.bind_all("<Button-5>", _on_wheel)
+        def _wheel_off(_e):
+            _canvas.unbind_all("<MouseWheel>")
+            _canvas.unbind_all("<Button-4>")
+            _canvas.unbind_all("<Button-5>")
+        _canvas.bind("<Enter>", _wheel_on)
+        _canvas.bind("<Leave>", _wheel_off)
+
+        self.minsize(640, 480)
 
         # ── 1. COM port ───────────────────────────────────────────────────────
         card1 = self._card(body, "1 · COM port")
@@ -207,6 +284,20 @@ class Hub(tk.Tk):
                           "lickometer_settings.json inside",
                  font=FONT, bg=BG_PNL, fg=FG_MUT).pack(side=tk.LEFT, padx=8)
 
+        # Day number — data is written into a per-day subfolder (Day<N>) so the
+        # hub can be re-run each day without overwriting previous days' data.
+        f3 = tk.Frame(card3, bg=BG_PNL)
+        f3.pack(fill=tk.X, pady=2)
+        tk.Label(f3, text="Day number:", font=FONT, bg=BG_PNL, fg=FG, width=12,
+                 anchor="w").pack(side=tk.LEFT)
+        self._day_var = tk.IntVar(value=1)
+        tk.Spinbox(f3, from_=1, to=999, textvariable=self._day_var, width=6,
+                   font=FONTM, bg=BG_ALT, fg=FG, relief=tk.FLAT
+                   ).pack(side=tk.LEFT, padx=4)
+        tk.Label(f3, text="→  data saved under  <new folder>/Day<N>/  "
+                          "(settings stay shared across days)",
+                 font=FONT, bg=BG_PNL, fg=FG_MUT).pack(side=tk.LEFT, padx=8)
+
         # ── 4. Arduino sketch ─────────────────────────────────────────────────
         card4 = self._card(body, "4 · Arduino sketch (optional upload)")
         s1 = tk.Frame(card4, bg=BG_PNL)
@@ -233,6 +324,42 @@ class Hub(tk.Tk):
             bg=CLR_BLU, fg="white", relief=tk.FLAT, padx=12,
             command=self._upload_sketch)
         self._upload_btn.pack(side=tk.LEFT, padx=8)
+        s3 = tk.Frame(card4, bg=BG_PNL)
+        s3.pack(fill=tk.X, pady=2)
+        self._autoupload_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            s3, text="Auto-upload this sketch before opening the instance "
+                     "(so the Arduino needn't be pre-flashed)",
+            variable=self._autoupload_var, font=FONT, bg=BG_PNL, fg=FG,
+            selectcolor=BG_ALT, activebackground=BG_PNL, activeforeground=FG
+            ).pack(side=tk.LEFT, padx=(98, 0))
+
+        # ── 5. Event-id map (advanced) ────────────────────────────────────────
+        card_evt = self._card(
+            body, "5 · Arduino event-id map (advanced — defaults usually fine)")
+        tk.Label(card_evt,
+                 text="Maps each box's lick/load events to Arduino channel ids. "
+                      "Lick-OFF ids are derived as lick-ON + 8.",
+                 font=FONT, bg=BG_PNL, fg=FG_MUT).pack(anchor="w", pady=(0, 4))
+        eg = tk.Frame(card_evt, bg=BG_PNL); eg.pack(fill=tk.X)
+        tk.Label(eg, text="Box", font=FONTB, bg=BG_PNL, fg=FG_MUT
+                 ).grid(row=0, column=0, padx=6, pady=2)
+        for c, key in enumerate(_EVT_KEYS):
+            tk.Label(eg, text=_EVT_LABELS[key], font=FONTB, bg=BG_PNL, fg=FG_MUT
+                     ).grid(row=0, column=c + 1, padx=6, pady=2)
+        self._evt_vars = {}
+        for box in range(1, 5):
+            tk.Label(eg, text=str(box), font=FONTM, bg=BG_PNL, fg=FG
+                     ).grid(row=box, column=0, padx=6, pady=1)
+            for c, key in enumerate(_EVT_KEYS):
+                var = tk.IntVar(value=DEFAULT_EVENT_CHANNELS[box][key])
+                self._evt_vars[(box, key)] = var
+                tk.Spinbox(eg, from_=0, to=63, textvariable=var, width=4,
+                           font=FONTM, bg=BG_ALT, fg=FG, relief=tk.FLAT
+                           ).grid(row=box, column=c + 1, padx=4, pady=1)
+        tk.Button(card_evt, text="Reset to defaults", font=FONTB, bg=BG_ALT,
+                  fg=FG, relief=tk.FLAT, padx=8,
+                  command=self._reset_event_map).pack(anchor="w", pady=(4, 0))
 
         # ── GUI script path + launch ──────────────────────────────────────────
         card5 = self._card(body, "Launch")
@@ -259,14 +386,16 @@ class Hub(tk.Tk):
         self._inst_lbl.pack(side=tk.LEFT, padx=14)
 
         # ── Log ───────────────────────────────────────────────────────────────
-        tk.Label(body, text="Activity log", font=FONTB, bg=BG, fg=FG
+        # Lives in the pinned `logwrap` (bottom of the window), not in the
+        # scrollable card area, so it is always on screen.
+        tk.Label(logwrap, text="Activity log", font=FONTB, bg=BG, fg=FG
                  ).pack(anchor="w", pady=(8, 2))
-        self._log = tk.Text(body, bg=BG_PNL, fg=FG, font=FONTM, relief=tk.FLAT,
-                            height=10, wrap=tk.WORD, state=tk.DISABLED)
-        lsb = ttk.Scrollbar(body, orient=tk.VERTICAL, command=self._log.yview)
+        self._log = tk.Text(logwrap, bg=BG_PNL, fg=FG, font=FONTM, relief=tk.FLAT,
+                            height=8, wrap=tk.WORD, state=tk.DISABLED)
+        lsb = ttk.Scrollbar(logwrap, orient=tk.VERTICAL, command=self._log.yview)
         self._log.configure(yscrollcommand=lsb.set)
         lsb.pack(side=tk.RIGHT, fill=tk.Y)
-        self._log.pack(fill=tk.BOTH, expand=True)
+        self._log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._log.tag_configure("err", foreground=CLR_RED)
         self._log.tag_configure("ok",  foreground=CLR_GRN)
         self._log.tag_configure("info", foreground=FG_MUT)
@@ -352,8 +481,32 @@ class Hub(tk.Tk):
     # SKETCH UPLOAD (Task H4)
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _upload_sketch(self):
-        """Compile + upload the selected sketch to the selected port via arduino-cli."""
+    def _reset_event_map(self):
+        """Restore the event-id spinboxes to the built-in defaults."""
+        for (box, key), var in self._evt_vars.items():
+            try:
+                var.set(DEFAULT_EVENT_CHANNELS[box][key])
+            except Exception:
+                pass
+
+    def _collect_event_channels(self, boxes):
+        """Read the event-id grid into {box: {key: id}} for the launched boxes."""
+        out = {}
+        for box in range(1, boxes + 1):
+            out[box] = {}
+            for key in _EVT_KEYS:
+                try:
+                    out[box][key] = int(self._evt_vars[(box, key)].get())
+                except Exception:
+                    out[box][key] = DEFAULT_EVENT_CHANNELS[box][key]
+        return out
+
+    def _upload_sketch(self, then=None):
+        """Compile + upload the selected sketch to the selected port via arduino-cli.
+
+        `then` (optional) is a no-arg callback run on the main thread after a
+        successful upload — used by launch auto-upload to start the GUI next.
+        """
         port   = self._port_var.get().strip()
         sketch = self._sketch_var.get().strip()
         fqbn   = self._fqbn_var.get().strip()
@@ -372,19 +525,60 @@ class Hub(tk.Tk):
         self._upload_btn.config(state=tk.DISABLED, text="Uploading…")
         self.log(f"Uploading {os.path.basename(sketch)} → {port} ({fqbn})…")
         threading.Thread(target=self._upload_worker,
-                         args=(port, sketch, fqbn), daemon=True).start()
+                         args=(port, sketch, fqbn, then), daemon=True).start()
 
-    def _upload_worker(self, port, sketch, fqbn):
+    def _ensure_core(self, fqbn, run):
+        """Ensure the platform core implied by `fqbn` is installed.
+
+        The core (platform) id is the first two colon-separated parts of the
+        FQBN — e.g. 'arduino:avr:mega' -> 'arduino:avr', 'esp32:esp32:esp32' ->
+        'esp32:esp32'. If it's already installed this is a quick local check and
+        nothing is downloaded. Returns True if the core is present (or was just
+        installed), False if installation failed. `run` is the streaming
+        subprocess helper from _upload_worker.
+        """
+        parts = fqbn.split(":")
+        if len(parts) < 2:
+            # Malformed FQBN — let the compile step surface a clear error.
+            return True
+        core_id = ":".join(parts[:2])
+
+        # Already installed? Ask arduino-cli quietly (local, no network).
+        try:
+            p = subprocess.run([ARDUINO_CLI, "core", "list"],
+                               capture_output=True, text=True, timeout=60)
+            for ln in (p.stdout or "").splitlines():
+                if ln.strip().lower().startswith(core_id.lower()):
+                    self.log(f"Core {core_id} already installed.", "info")
+                    return True
+        except Exception as e:
+            self.log(f"  (couldn't check installed cores: {e})", "info")
+
+        # Not found — install it (first-time setup; needs internet).
+        self.log(f"Core {core_id} not installed — fetching it now "
+                 "(first-time setup, needs internet)…")
+        if run([ARDUINO_CLI, "core", "update-index"]) != 0:
+            self.log("Couldn't refresh the core index — check your internet "
+                     "connection. Trying the install anyway…", "err")
+        if run([ARDUINO_CLI, "core", "install", core_id]) != 0:
+            self.log(f"Core install failed for {core_id}. Install it manually "
+                     f"in a terminal:  arduino-cli core install {core_id}", "err")
+            return False
+        self.log(f"Core {core_id} installed.", "ok")
+        return True
+
+    def _upload_worker(self, port, sketch, fqbn, then=None):
         """Background: run arduino-cli compile + upload, streaming output to the log."""
         sketch_dir = os.path.dirname(os.path.abspath(sketch))
         try:
             # Verify arduino-cli is available.
-            subprocess.run(["arduino-cli", "version"],
+            subprocess.run([ARDUINO_CLI, "version"],
                            capture_output=True, text=True, timeout=20)
         except FileNotFoundError:
-            self.log("arduino-cli not found on PATH. Install it from "
-                     "https://arduino.github.io/arduino-cli/ (or flash via the "
-                     "Arduino IDE), then retry.", "err")
+            self.log(f"arduino-cli not found (looked for: {ARDUINO_CLI}). Put "
+                     "arduino-cli.exe in the same folder as this hub script, or "
+                     "install it from https://arduino.github.io/arduino-cli/ and "
+                     "add it to PATH, then retry.", "err")
             self._reenable_upload()
             return
         except Exception as e:
@@ -408,15 +602,23 @@ class Hub(tk.Tk):
                                  "err" if p.returncode else "info")
             return p.returncode
 
-        rc = run(["arduino-cli", "compile", "--fqbn", fqbn, sketch_dir])
+        # Make sure the board's platform core is installed before compiling,
+        # so a fresh machine doesn't fail compile with "platform not installed".
+        if not self._ensure_core(fqbn, run):
+            self._reenable_upload()
+            return
+
+        rc = run([ARDUINO_CLI, "compile", "--fqbn", fqbn, sketch_dir])
         if rc != 0:
             self.log("Compile failed — fix the sketch / FQBN and retry.", "err")
             self._reenable_upload()
             return
-        rc = run(["arduino-cli", "upload", "-p", port,
+        rc = run([ARDUINO_CLI, "upload", "-p", port,
                   "--fqbn", fqbn, sketch_dir])
         if rc == 0:
             self.log(f"Upload OK → {port}.", "ok")
+            if then is not None:
+                self.after(0, then)
         else:
             self.log("Upload failed — check the port, board and cable.", "err")
         self._reenable_upload()
@@ -440,6 +642,7 @@ class Hub(tk.Tk):
         name   = self._newfolder_var.get().strip()
         gui    = self._gui_var.get().strip()
         boxes  = int(self._boxes_var.get())
+        day    = int(self._day_var.get())
 
         if not port:
             messagebox.showwarning("No port", "Select or type a COM port first.")
@@ -458,7 +661,8 @@ class Hub(tk.Tk):
             return
 
         instance_folder = os.path.join(parent, name)
-        data_folder     = os.path.join(instance_folder, "data")
+        day_folder      = os.path.join(instance_folder, f"Day{day}")
+        data_folder     = os.path.join(day_folder, "data")
         settings_file   = os.path.join(instance_folder,
                                        "lickometer_settings.json")
         try:
@@ -471,9 +675,13 @@ class Hub(tk.Tk):
         config = {
             "port":            port,
             "num_boxes":       boxes,
+            "day_number":      day,
             "instance_folder": instance_folder,
+            "day_folder":      day_folder,
             "data_folder":     data_folder,
             "settings_file":   settings_file,
+            "event_channels":  {str(b): m for b, m in
+                                self._collect_event_channels(boxes).items()},
             "sketch_name":     os.path.basename(sketch) if sketch else "",
             "sketch_path":     sketch,
             "created":         datetime.datetime.now().isoformat(timespec="seconds"),
@@ -486,6 +694,19 @@ class Hub(tk.Tk):
             messagebox.showerror("Cannot write config", str(e))
             return
 
+        # Optionally flash the sketch first so the Arduino needn't be pre-loaded.
+        sketch = self._sketch_var.get().strip()
+        if (getattr(self, "_autoupload_var", None) and self._autoupload_var.get()
+                and sketch and os.path.isfile(sketch)):
+            self.log("Auto-upload requested — flashing before launch…")
+            self._upload_sketch(then=lambda: self._spawn_gui(
+                gui, cfg_path, port, boxes, instance_folder))
+            return
+
+        self._spawn_gui(gui, cfg_path, port, boxes, instance_folder)
+
+    def _spawn_gui(self, gui, cfg_path, port, boxes, instance_folder):
+        """Start the GUI process for a written launch config and track it."""
         try:
             proc = subprocess.Popen([sys.executable, gui, "--config", cfg_path])
         except Exception as e:
