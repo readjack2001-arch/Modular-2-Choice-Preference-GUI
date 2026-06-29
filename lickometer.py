@@ -187,6 +187,20 @@ except NameError:                       # e.g. interactive / some Spyder configs
     _HERE = os.getcwd()
 SETTINGS_FILE = os.path.join(_HERE, "lickometer_settings.json")
 
+
+def set_settings_file(path: str):
+    """Point all settings reads/writes at a specific JSON file.
+
+    The hub launches each GUI instance with its OWN settings file inside that
+    instance's folder, so calibrations / flag thresholds / plot visuals are
+    unique per instance (Task H3). load_settings(), _write_settings() and the
+    save_* helpers all read this module global at call time, so reassigning it
+    here before MainWindow builds is sufficient — no other code changes needed.
+    """
+    global SETTINGS_FILE
+    if path:
+        SETTINGS_FILE = os.path.abspath(path)
+
 DEFAULT_SETTINGS = {
     "shared": {
         "flags": {
@@ -202,6 +216,9 @@ DEFAULT_SETTINGS = {
             "load_ymin":   LOAD_YMIN,
             "load_ymax":   LOAD_YMAX,
             "load_yticks": LOAD_YTICKS,
+            # Load-cell display (Task V1 / LC27)
+            "load_show":      1,     # 1/0: capture + plot load cell data at all
+            "load_linewidth": 1.2,   # full-view (Box tab) load line width
             # Monitor (live 4-row quadrant) raster timing
             "monitor_timebin_ms":      TIMEBIN_MS,
             "monitor_seconds_per_row": SECONDS_PER_ROW,
@@ -214,6 +231,10 @@ DEFAULT_SETTINGS = {
         "save_folder":      "",
         "weight_interval":  30,
         "autosave_minutes": AUTOSAVE_MINUTES,
+        # ── Hub-provided instance config (Task H2/H3/H4) ──
+        "num_boxes":        4,     # 1-4: how many boxes this instance drives
+        "sketch_name":      "",    # filename of the Arduino sketch flashed
+        "sketch_path":      "",    # full path of the Arduino sketch flashed
     },
     # "ports": { "COM3": {"thresholds": {...}, "calibration": {...}}, ... }
     "ports": {},
@@ -569,6 +590,9 @@ class ExperimentModel:
         self.cal_left:  float = 1.0   # software calibration ratio for left load cell
         self.cal_right: float = 1.0   # software calibration ratio for right load cell
 
+        # Task V1: when False, load-cell events are neither captured nor plotted.
+        self.capture_load: bool = True
+
         # ── Load-cell flag baselines (populated at runtime) ──────────────────
         # initial_load_*  : the very first calibrated reading after experiment starts;
         #                   flag fires if reading exceeds this by +0.5 g (drink event).
@@ -658,6 +682,8 @@ class ExperimentModel:
 
         # ── Load cell events ──────────────────────────────────────────────────
         elif aid == self.l_load_id:
+            if not self.capture_load:        # Task V1: skip capture entirely
+                return flags
             cal_val = amp * self.cal_left   # apply software calibration ratio
 
             # Capture the very first reading as the initial baseline.
@@ -670,19 +696,32 @@ class ExperimentModel:
             if self.initial_load_left is not None:
                 drink_now = cal_val >= self.initial_load_left + self.DRINK_DELTA_G
                 if drink_now and not self._drink_flag_left:
-                    flags.append(f"Exp {self.exp_id} L: drink detected "
-                                 f"(+{cal_val - self.initial_load_left:.2f} g above initial)")
+                    flags.append((f"Box {self.exp_id} L: drink detected "
+                                  f"(+{cal_val - self.initial_load_left:.2f} g "
+                                  f"above initial)", "warning"))
+                elif self._drink_flag_left and not drink_now:   # F3 resolution
+                    flags.append((f"Box {self.exp_id} L: drink flag resolved "
+                                  f"(weight back within {self.DRINK_DELTA_G:g} g "
+                                  f"of initial)", "resolved"))
                 self._drink_flag_left = drink_now
 
             # Flag 2: below-offset — weight dropped below the empty-bottle baseline
             if self.offset_weight_left is not None:
                 below_now = cal_val < self.offset_weight_left
                 if below_now and not self._below_flag_left:
-                    flags.append(f"Exp {self.exp_id} L: load below offset weight "
-                                 f"({cal_val:.2f} g < offset {self.offset_weight_left:.2f} g)")
+                    flags.append((f"Box {self.exp_id} L: load below offset weight "
+                                  f"(−{self.offset_weight_left - cal_val:.2f} g "
+                                  f"below offset {self.offset_weight_left:.2f} g)",
+                                  "warning"))
+                elif self._below_flag_left and not below_now:   # F3 resolution
+                    flags.append((f"Box {self.exp_id} L: below-offset flag "
+                                  f"resolved (weight back at/above offset)",
+                                  "resolved"))
                 self._below_flag_left = below_now
 
         elif aid == self.r_load_id:
+            if not self.capture_load:        # Task V1: skip capture entirely
+                return flags
             cal_val = amp * self.cal_right  # apply software calibration ratio
 
             # Capture the very first reading as the initial baseline.
@@ -695,16 +734,27 @@ class ExperimentModel:
             if self.initial_load_right is not None:
                 drink_now = cal_val >= self.initial_load_right + self.DRINK_DELTA_G
                 if drink_now and not self._drink_flag_right:
-                    flags.append(f"Exp {self.exp_id} R: drink detected "
-                                 f"(+{cal_val - self.initial_load_right:.2f} g above initial)")
+                    flags.append((f"Box {self.exp_id} R: drink detected "
+                                  f"(+{cal_val - self.initial_load_right:.2f} g "
+                                  f"above initial)", "warning"))
+                elif self._drink_flag_right and not drink_now:   # F3 resolution
+                    flags.append((f"Box {self.exp_id} R: drink flag resolved "
+                                  f"(weight back within {self.DRINK_DELTA_G:g} g "
+                                  f"of initial)", "resolved"))
                 self._drink_flag_right = drink_now
 
             # Flag 2: below-offset — weight dropped below the empty-bottle baseline
             if self.offset_weight_right is not None:
                 below_now = cal_val < self.offset_weight_right
                 if below_now and not self._below_flag_right:
-                    flags.append(f"Exp {self.exp_id} R: load below offset weight "
-                                 f"({cal_val:.2f} g < offset {self.offset_weight_right:.2f} g)")
+                    flags.append((f"Box {self.exp_id} R: load below offset weight "
+                                  f"(−{self.offset_weight_right - cal_val:.2f} g "
+                                  f"below offset {self.offset_weight_right:.2f} g)",
+                                  "warning"))
+                elif self._below_flag_right and not below_now:   # F3 resolution
+                    flags.append((f"Box {self.exp_id} R: below-offset flag "
+                                  f"resolved (weight back at/above offset)",
+                                  "resolved"))
                 self._below_flag_right = below_now
 
         return flags
@@ -747,7 +797,7 @@ class ExperimentModel:
         try:
             now = self.elapsed(now_ts)
             log = self.get_log()
-            flags: List[str] = []
+            flags: List[Tuple[str, str]] = []
 
             on_l  = [r.timestamp_ms for r in log if r.event_id == _L_ON]
             on_r  = [r.timestamp_ms for r in log if r.event_id == _R_ON]
@@ -759,9 +809,13 @@ class ExperimentModel:
             nolick_ms = cfg["no_lick_minutes"] * 60_000
             last_lick = onsets[-1] if onsets else 0
             cond = (now - last_lick) > nolick_ms
-            if cond and not self._fs.get("nolick"):
-                flags.append(
-                    f"longer than {cfg['no_lick_minutes']:g} minutes with no lick")
+            prev = self._fs.get("nolick", False)
+            if cond and not prev:
+                flags.append((f"longer than {cfg['no_lick_minutes']:g} minutes "
+                              f"with no lick", "flag"))
+            elif prev and not cond:                              # F3 resolution
+                flags.append(("no-lick flag resolved (licking resumed)",
+                              "resolved"))
             self._fs["nolick"] = cond
 
             # ── 2b-ii: prolonged single continuous lick (> X seconds) ─────────
@@ -770,10 +824,14 @@ class ExperimentModel:
                 oo = _open_onset(ons, offs)
                 key = f"plick_{side}"
                 c = oo is not None and (now - oo) > plick_ms
-                if c and not self._fs.get(key):
-                    flags.append(
-                        f"prolonged lick longer than "
-                        f"{cfg['prolonged_lick_seconds']:g} seconds ({side})")
+                prev = self._fs.get(key, False)
+                if c and not prev:
+                    flags.append((f"prolonged lick longer than "
+                                  f"{cfg['prolonged_lick_seconds']:g} seconds "
+                                  f"({side})", "flag"))
+                elif prev and not c:                             # F3 resolution
+                    flags.append((f"prolonged-lick flag resolved ({side})",
+                                  "resolved"))
                 self._fs[key] = c
 
             # ── 2b-iii: prolonged lick bout (> X minutes of ongoing licking) ──
@@ -791,10 +849,13 @@ class ExperimentModel:
                             break
                     if (now - bout_start) > bout_ms:
                         bout_cond = True
-            if bout_cond and not self._fs.get("bout"):
-                flags.append(
-                    f"prolonged lick bout longer than "
-                    f"{cfg['prolonged_bout_minutes']:g} minutes")
+            prev = self._fs.get("bout", False)
+            if bout_cond and not prev:
+                flags.append((f"prolonged lick bout longer than "
+                              f"{cfg['prolonged_bout_minutes']:g} minutes", "flag"))
+            elif prev and not bout_cond:                         # F3 resolution
+                flags.append(("prolonged-bout flag resolved (bout ended)",
+                              "resolved"))
             self._fs["bout"] = bout_cond
 
             # ── 2c: load-cell sanity checks, sampled on their own windows ─────
@@ -810,9 +871,9 @@ class ExperimentModel:
                     rng   = self._load_range(log, load_eid, now - a_ms, now)
                     if licks > 0 and rng is not None and rng <= tol:
                         flags.append(
-                            f"no change in load cell value after "
-                            f"{cfg['load_nochange_minutes']:g} minutes of "
-                            f"licking ({side})")
+                            (f"no change in load cell value after "
+                             f"{cfg['load_nochange_minutes']:g} minutes of "
+                             f"licking ({side})", "flag"))
 
             # 2c-ii: load value changed but no licks
             b_ms = cfg["load_nolick_minutes"] * 60_000
@@ -824,8 +885,9 @@ class ExperimentModel:
                     rng   = self._load_range(log, load_eid, now - b_ms, now)
                     if licks == 0 and rng is not None and rng > tol:
                         flags.append(
-                            f"changes in load cell value despite no licks in "
-                            f"past {cfg['load_nolick_minutes']:g} minutes ({side})")
+                            (f"changes in load cell value despite no licks in "
+                             f"past {cfg['load_nolick_minutes']:g} minutes "
+                             f"({side})", "flag"))
 
             return flags
         except Exception as e:
@@ -870,6 +932,60 @@ def _fmt_hms(seconds: float) -> str:
     return f"{m}:{sec:02d}"
 
 
+def _value_at(samples, t):
+    """Last sample value at or before time t (step/zero-order hold), or None.
+
+    `samples` is a list of (t_ms, value) sorted by time. Used to carry the most
+    recent load reading forward so the trace has no gaps (Task LC24).
+    """
+    import bisect
+    if not samples:
+        return None
+    ts = [s[0] for s in samples]
+    i = bisect.bisect_right(ts, t) - 1
+    if i < 0:
+        return None
+    return samples[i][1]
+
+
+def _row_step_polyline(samples, row_lo_ms, row_hi_ms, tb, bpr, t_end_ms=None):
+    """Step polyline for one raster row, spanning the FULL row width (Task LC24).
+
+    Returns (xs, ys) in bin-units where xs runs 0 → bpr with zero-order-hold
+    steps, so the load trace is continuous left-to-right across the whole row
+    instead of starting at the first sample and ending at the last. `samples`
+    is the complete (t_ms, value) history for that channel, sorted by time; the
+    value carried in at the row's left edge is whatever was last seen before it.
+
+    `t_end_ms` bounds the trace to the data's actual extent: the hold is not
+    carried past it, so rows entirely after the last event stay empty (no
+    drawing into the empty future). Callers prepend a (0, first_value) sample so
+    the trace also reaches back to the experiment start (first-report continuity).
+    """
+    if t_end_ms is not None and row_lo_ms >= t_end_ms:
+        return [], []                       # row is entirely past the data
+    right_ms = row_hi_ms
+    if t_end_ms is not None:
+        right_ms = min(row_hi_ms, t_end_ms)
+    right_x = (right_ms - row_lo_ms) / tb
+    carried = _value_at(samples, row_lo_ms)
+    in_row = [(t, v) for (t, v) in samples
+              if row_lo_ms <= t < row_hi_ms and (t_end_ms is None or t <= t_end_ms)]
+    xs, ys = [], []
+    if carried is not None:
+        xs.append(0.0); ys.append(carried)
+    cur = carried
+    for t, v in in_row:
+        x = (t - row_lo_ms) / tb
+        if cur is not None:          # horizontal hold then vertical step
+            xs.append(x); ys.append(cur)
+        xs.append(x); ys.append(v)
+        cur = v
+    if cur is not None:
+        xs.append(float(right_x)); ys.append(cur)
+    return xs, ys
+
+
 class RasterPanel:
     """Fixed-size matplotlib raster showing the most recent rows for one exp."""
 
@@ -886,6 +1002,8 @@ class RasterPanel:
         self.load_ymin   = LOAD_YMIN
         self.load_ymax   = LOAD_YMAX
         self.load_yticks = LOAD_YTICKS
+        self.load_show   = True     # Task V1
+        self.load_lw     = 0.9      # monitor load line width
 
         # A single, fixed-size figure — no scroll canvas, no figure resizing.
         self._fig = Figure(figsize=(6, 2.6), dpi=96, facecolor=BG_PNL)
@@ -902,11 +1020,17 @@ class RasterPanel:
         return max(1, (self.seconds_per_row * 1000) // self.timebin_ms)
 
     # ── configuration setters ──────────────────────────────────────────────────
-    def set_load_axis(self, ymin: float, ymax: float, yticks: int):
+    def set_load_axis(self, ymin: float, ymax: float, yticks: int,
+                      show: Optional[bool] = None,
+                      linewidth: Optional[float] = None):
         """Update the fixed load-cell gram limits (from the visuals tab)."""
         self.load_ymin   = ymin
         self.load_ymax   = ymax
         self.load_yticks = max(2, int(yticks))
+        if show is not None:
+            self.load_show = bool(show)
+        if linewidth is not None:
+            self.load_lw = max(0.1, float(linewidth))
 
     def set_time_params(self, timebin_ms: int, seconds_per_row: int,
                         visible_rows: Optional[int] = None):
@@ -949,7 +1073,8 @@ class RasterPanel:
             if (first_row + d) % 2 == 1:
                 ax.axhspan(d, d + 1, color=BG_ALT, zorder=0, linewidth=0)
 
-        self._draw_load_ticks(ax, n_disp, bpr)
+        if self.load_show:
+            self._draw_load_ticks(ax, n_disp, bpr)
 
         # ── Filled lick blocks (kept identical in style to the old quadrant) ────
         for on_eid, off_eid, color in ((_L_ON, _L_OFF, CLR_L),
@@ -994,31 +1119,43 @@ class RasterPanel:
             ax.plot([bin_x, bin_x], [d, d + 0.95],
                     color=CLR_EXP, linewidth=1.8, zorder=5)
 
-        # ── Load cell area plots (Task 5: fixed gram limits) ────────────────────
+        # ── Load cell traces (Task V1/LC24/LC25/LC26) ───────────────────────────
+        # V1: only when enabled. LC24: continuous zero-order-hold across the full
+        # row width (no gaps). LC25: HIGH value at the TOP of the row band, low at
+        # the bottom. LC26: shading stays within the row band (line → row bottom).
         span = self.load_ymax - self.load_ymin
-        if span > 0:
+        if self.load_show and span > 0:
+            t_end = max((e.timestamp_ms for e in events), default=0)
+            band_top = 0.08          # fraction below the row's top edge
+            band_bot = 0.92          # fraction above the row's bottom edge
+            band_h   = band_bot - band_top
             for load_eid, color in ((_L_LOAD, CLR_L), (_R_LOAD, CLR_R)):
-                evts = [e for e in events
-                        if e.event_id == load_eid and e.timestamp_ms >= win_lo]
-                if len(evts) < 2:
+                samples = sorted(
+                    (e.timestamp_ms,
+                     float(np.clip((e.amplitude - self.load_ymin) / span, 0.0, 1.0)))
+                    for e in events if e.event_id == load_eid)
+                if not samples:
                     continue
-                amps = np.array([e.amplitude for e in evts])
-                norm = np.clip((amps - self.load_ymin) / span, 0.0, 1.0)
-                by_row: Dict[int, List[Tuple[float, float]]] = {}
-                for e, nval in zip(evts, norm):
-                    r = e.timestamp_ms // row_ms
-                    if r < first_row:
+                # Carry the first reading back to t=0 so the trace reaches the
+                # experiment start (first-report continuity, Task LC24).
+                if samples[0][0] > 0:
+                    samples = [(0, samples[0][1])] + samples
+                for d in range(n_disp):
+                    row_idx = first_row + d
+                    row_lo  = row_idx * row_ms
+                    row_hi  = row_lo + row_ms
+                    xs, ysn = _row_step_polyline(samples, row_lo, row_hi, tb,
+                                                 bpr, t_end_ms=t_end)
+                    if not xs:
                         continue
-                    bx = (e.timestamp_ms % row_ms) / tb
-                    by_row.setdefault(r - first_row, []).append((bx, nval))
-                for d, pts in by_row.items():
-                    pts.sort()
-                    xs = np.array([p[0] for p in pts])
-                    ys = np.array([p[1] for p in pts]) * 0.65 + d
-                    ax.fill_between(xs, d, ys, color=color, alpha=0.18,
-                                    linewidth=0, zorder=2)
-                    ax.plot(xs, ys, color=color, alpha=0.50,
-                            linewidth=0.9, zorder=2)
+                    xs  = np.asarray(xs)
+                    ysn = np.asarray(ysn)
+                    line_y = (d + band_bot) - ysn * band_h     # high → top
+                    base_y = d + band_bot                      # row bottom
+                    ax.fill_between(xs, line_y, base_y, color=color,
+                                    alpha=0.16, linewidth=0, zorder=2)
+                    ax.plot(xs, line_y, color=color, alpha=0.55,
+                            linewidth=self.load_lw, zorder=2)
 
         self._canvas.draw_idle()
 
@@ -1050,7 +1187,7 @@ class RasterPanel:
              for d in range(n_disp)],
             fontsize=6, color=FG_MUT)
 
-        ax.set_title(f"Exp {self.exp_id}", fontsize=8, color=FG, pad=3, loc="left")
+        ax.set_title(f"Box {self.exp_id}", fontsize=8, color=FG, pad=3, loc="left")
         ax.legend(
             handles=[
                 mpatches.Patch(color=CLR_L,           label="L lick"),
@@ -1073,22 +1210,24 @@ class RasterPanel:
         span = self.load_ymax - self.load_ymin
         if span <= 0:
             return
+        band_top, band_bot = 0.08, 0.92
+        band_h = band_bot - band_top
         ticks = np.linspace(self.load_ymin, self.load_ymax,
                             max(2, int(self.load_yticks)))
         for d in range(n_disp):
             for tg in ticks:
                 frac = (tg - self.load_ymin) / span
-                y = d + frac * 0.65
+                y = (d + band_bot) - frac * band_h        # high value → top
                 ax.plot([0, bpr], [y, y], color=FG_MUT, alpha=0.10,
                         linewidth=0.5, linestyle=(0, (2, 3)), zorder=1)
-        # Right-axis scale labels: min at each row's baseline, max at its peak.
+        # Right-edge scale labels: MAX at the row top, MIN at the row bottom.
         for d in range(n_disp):
-            ax.text(bpr * 1.01, d + 0.0,  f"{self.load_ymin:g}",
+            ax.text(bpr * 1.01, d + band_bot, f"{self.load_ymin:g}",
                     fontsize=5, color=FG_MUT, va="center", ha="left")
-            ax.text(bpr * 1.01, d + 0.65, f"{self.load_ymax:g}",
+            ax.text(bpr * 1.01, d + band_top, f"{self.load_ymax:g}",
                     fontsize=5, color=FG_MUT, va="center", ha="left")
-        # Unit marker, once, just below the first row's max label.
-        ax.text(bpr * 1.01, 0.80, "g", fontsize=5, color=FG_MUT,
+        # Unit marker, once, just above the first row's max label.
+        ax.text(bpr * 1.01, 0.0, "g", fontsize=5, color=FG_MUT,
                 va="center", ha="left")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1121,7 +1260,7 @@ class ExpQuadrant(tk.Frame):
         top = tk.Frame(self, bg=BG_PNL, pady=3)
         top.pack(fill=tk.X, padx=4)
 
-        tk.Label(top, text=f"Experiment {self.model.exp_id}",
+        tk.Label(top, text=f"Box {self.model.exp_id}",
                  font=FONTB, bg=BG_PNL, fg=FG).pack(side=tk.LEFT, padx=6)
 
         self._run_btn = tk.Button(
@@ -1151,7 +1290,8 @@ class ExpQuadrant(tk.Frame):
             seconds_per_row=mp["monitor_seconds_per_row"])
         pv = self._host.plot_settings()
         self._raster.set_load_axis(pv["load_ymin"], pv["load_ymax"],
-                                   pv["load_yticks"])
+                                   pv["load_yticks"],
+                                   show=bool(pv.get("load_show", 1)))
 
         # Rolling event log (last X minutes only).
         log_outer = tk.Frame(self, bg=BG_PNL, height=108)
@@ -1188,12 +1328,24 @@ class ExpQuadrant(tk.Frame):
         self._tree.tag_configure("exp",   foreground=CLR_EXP)
         self._tree.tag_configure("load",  foreground=FG_MUT)
 
+    def set_run_locked(self, locked: bool):
+        """Task S1: disable the Run button during the post-stream lockout.
+
+        When unlocking, only re-enable Run if the experiment isn't already
+        running (so a running box keeps Run disabled as usual).
+        """
+        if locked:
+            self._run_btn.config(state=tk.DISABLED)
+        elif not self.model.running:
+            self._run_btn.config(state=tk.NORMAL)
+
     def apply_plot_settings(self):
         """Re-apply visuals-tab settings (load axis + monitor timing) and redraw."""
         pv = self._host.plot_settings()
         mp = self._host.monitor_settings()
         self._raster.set_load_axis(pv["load_ymin"], pv["load_ymax"],
-                                   pv["load_yticks"])
+                                   pv["load_yticks"],
+                                   show=bool(pv.get("load_show", 1)))
         self._raster.set_time_params(mp["monitor_timebin_ms"],
                                      mp["monitor_seconds_per_row"])
         self._raster.update(self.model.get_log())
@@ -1339,6 +1491,8 @@ class FullViewPanel(tk.Frame):
         # load line plots use the same scale as the monitor quadrants).
         self.load_ymin = LOAD_YMIN
         self.load_ymax = LOAD_YMAX
+        self.load_show = True       # Task V1
+        self.load_lw   = 1.2        # Task LC27: half the old 2.4 default
 
         self._fig = Figure(figsize=(10, 6.5), dpi=96, facecolor=BG)
         # Main raster (left, wide) + two slim colour-bar axes stacked on the right.
@@ -1359,10 +1513,16 @@ class FullViewPanel(tk.Frame):
         """Number of x-bins per row at the current row span / bin width."""
         return max(1, self.seconds_per_row // self.bin_seconds)
 
-    def set_load_axis(self, ymin: float, ymax: float):
+    def set_load_axis(self, ymin: float, ymax: float,
+                      show: Optional[bool] = None,
+                      linewidth: Optional[float] = None):
         """Set the gram limits used to normalise the load-cell line plots."""
         self.load_ymin = ymin
         self.load_ymax = ymax
+        if show is not None:
+            self.load_show = bool(show)
+        if linewidth is not None:
+            self.load_lw = max(0.1, float(linewidth))
 
     def reconfigure(self, rows: int, seconds_per_row: int, bin_seconds: int):
         """Change the grid geometry. Picked up on the next update_view()."""
@@ -1447,34 +1607,47 @@ class FullViewPanel(tk.Frame):
         self._draw_count_bar(self._cax_l, self._CMAP_L, maxL, "L licks/bin")
         self._draw_count_bar(self._cax_r, self._CMAP_R, maxR, "R licks/bin")
 
-        # ── Load-cell line plots: left = teal, right = purple (Tol muted),
-        #    slightly offset vertically from each other; thick line, no fill ───
+        # ── Load-cell line plots (Task V1/LC24/LC25/LC27/LC28) ──────────────────
+        # V1: only when enabled. LC24: zero-order-hold across the full row width.
+        # LC25: HIGH value at the row TOP. LC27: editable (default-halved) width.
         span = self.load_ymax - self.load_ymin
-        if span > 0:
-            for load_eid, color, dy in ((_L_LOAD, CLR_LOAD_L, +0.06),
-                                        (_R_LOAD, CLR_LOAD_R, -0.06)):
-                by_row: Dict[int, List[Tuple[float, float]]] = {}
-                for e in events:
-                    if e.event_id != load_eid:
+        if self.load_show and span > 0:
+            t_end = max((e.timestamp_ms for e in events), default=0)
+            band_top, band_bot = 0.12, 0.88
+            band_h = band_bot - band_top
+            tb_ms  = bin_s * 1000                  # ms per column
+            for load_eid, color in ((_L_LOAD, CLR_LOAD_L), (_R_LOAD, CLR_LOAD_R)):
+                samples = sorted(
+                    (e.timestamp_ms,
+                     float(min(max((e.amplitude - self.load_ymin) / span, 0.0), 1.0)))
+                    for e in events if e.event_id == load_eid)
+                if not samples:
+                    continue
+                if samples[0][0] > 0:              # carry first reading back to 0
+                    samples = [(0, samples[0][1])] + samples
+                for r in range(R):
+                    row_lo = r * sec_row * 1000
+                    row_hi = (r + 1) * sec_row * 1000
+                    xs, ysn = _row_step_polyline(samples, row_lo, row_hi,
+                                                 tb_ms, C, t_end_ms=t_end)
+                    if not xs:
                         continue
-                    t_s = e.timestamp_ms / 1000.0
-                    r = int(t_s // sec_row)
-                    if r < 0 or r >= R:
-                        continue
-                    x = (t_s % sec_row) / bin_s                 # column units
-                    nval = min(max((e.amplitude - self.load_ymin) / span,
-                                   0.0), 1.0)
-                    by_row.setdefault(r, []).append((x, nval))
-                for r, pts in by_row.items():
-                    if len(pts) < 2:
-                        continue
-                    pts.sort()
-                    xs = np.array([p[0] for p in pts])
-                    # centre the trace in the row band and add the per-side
-                    # offset so the two lines don't sit on top of each other
-                    ys = r + 0.18 + np.array([p[1] for p in pts]) * 0.6 + dy
-                    ax.plot(xs, ys, color=color, alpha=0.9,
-                            linewidth=2.4, zorder=4)
+                    xs  = np.asarray(xs)
+                    ysn = np.asarray(ysn)
+                    line_y = (r + band_bot) - ysn * band_h   # high → top
+                    ax.plot(xs, line_y, color=color, alpha=0.9,
+                            linewidth=self.load_lw, zorder=4)
+
+            # LC28: right-edge load-cell gram labels (max at row top, min at bottom).
+            for r in range(R):
+                ax.text(C * 1.005, r + band_top, f"{self.load_ymax:g}",
+                        fontsize=6, color=FG_MUT, va="center", ha="left",
+                        zorder=6)
+                ax.text(C * 1.005, r + band_bot, f"{self.load_ymin:g}",
+                        fontsize=6, color=FG_MUT, va="center", ha="left",
+                        zorder=6)
+            ax.text(C * 1.005, -0.15, "g", fontsize=6, color=FG_MUT,
+                    va="center", ha="left", zorder=6)
 
         # Re-assert limits (imshow can otherwise rescale them).
         ax.set_xlim(0, C)
@@ -1520,6 +1693,9 @@ class FullViewPanel(tk.Frame):
             if xpos <= C:
                 xt.append(xpos)
             i += 1
+        # LC28: one extra tick mark at the row's right edge.
+        if xt and xt[-1] < C:
+            xt.append(C)
         ax.set_xticks(xt)
         ax.set_xticklabels(
             [f"{(x * self.bin_seconds / 60):g}" for x in xt],
@@ -1527,14 +1703,15 @@ class FullViewPanel(tk.Frame):
         ax.set_xlabel("time within row (min)", fontsize=8, color=FG_MUT)
 
         # Y ticks: one per row (capped), labelled by the row's start time.
-        n_yt = min(R, 12)
+        # LC28: one extra tick beyond the usual cap.
+        n_yt = min(R, 13)
         yt = sorted(set(np.linspace(0, R - 1, n_yt).round().astype(int).tolist()))
         ax.set_yticks([v + 0.5 for v in yt])
         ax.set_yticklabels([_fmt_hms(v * self.seconds_per_row) for v in yt],
                            fontsize=7, color=FG_MUT)
         ax.set_ylabel("row start", fontsize=8, color=FG_MUT)
 
-        ax.set_title(f"Exp {self.exp_id} — licks (L rose / R cyan, intensity = "
+        ax.set_title(f"Box {self.exp_id} — licks (L rose / R cyan, intensity = "
                      f"count) + load", fontsize=10, color=FG, loc="left", pad=4)
         ax.legend(
             handles=[
@@ -1555,16 +1732,57 @@ class FullViewPanel(tk.Frame):
 # MAIN WINDOW
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Task S1: rotating messages shown for 9 s after the Arduino stream starts, one
+# every 1.5 s (6 messages × 1.5 s = 9 s), while run + calibration are locked.
+INIT_MSGS = [
+    "initializing...verifying mouse aliveness",
+    "initializing...monitoring radiation levels",
+    "initializing...putting out fires",
+    "initializing...preventing cataclysmic events",
+    "initializing...taking a coffee break",
+    "initialization complete...ready to lick",
+]
+INIT_LOCKOUT_MS = 9000
+INIT_STEP_MS    = 1500
+
 class MainWindow(tk.Tk):
-    def __init__(self, initial_port: Optional[str] = None):
-        """Read persisted settings, build the full GUI, and start the flag watchdog."""
+    def __init__(self, initial_port: Optional[str] = None,
+                 hub_config: Optional[dict] = None):
+        """Read persisted settings, build the full GUI, and start the flag watchdog.
+
+        `hub_config` (Task H1-H4), when supplied by the hub launcher, carries:
+            port            COM port this instance drives
+            num_boxes       1-4 boxes (drives tab count + monitor layout)
+            instance_folder the per-instance folder (settings json lives here)
+            data_folder     subfolder where autosaved per-box data is written
+            settings_file   per-instance settings json path (already applied)
+            autosave_minutes  optional autosave interval
+            sketch_name / sketch_path  the flashed Arduino sketch (recorded)
+        When hub_config is present the mandatory setup page is skipped and these
+        values are used directly; otherwise the original standalone setup page
+        runs so the GUI still works when launched on its own.
+        """
         super().__init__()
+
+        self._hub_config = hub_config or {}
 
         # Task 3: load persisted settings first so everything populates from them.
         self._settings = load_settings()
-        port = initial_port or self._settings["shared"].get("port") or SERIAL_PORT
+        port = (self._hub_config.get("port") or initial_port
+                or self._settings["shared"].get("port") or SERIAL_PORT)
 
-        self.title(f"Lickometer  ·  Columbia AIC  ·  {port}")
+        # Number of boxes this instance drives (Task H2). From the hub if given,
+        # else from persisted settings, clamped to 1-4.
+        try:
+            self.num_boxes = int(self._hub_config.get(
+                "num_boxes",
+                self._settings["shared"].get("num_boxes", 4)))
+        except (TypeError, ValueError):
+            self.num_boxes = 4
+        self.num_boxes = max(1, min(4, self.num_boxes))
+
+        self.title(f"Lickometer  ·  Columbia AIC  ·  {port}  ·  "
+                   f"{self.num_boxes} box{'es' if self.num_boxes != 1 else ''}")
         self.configure(bg=BG)
         self.geometry("1440x980")
 
@@ -1578,13 +1796,21 @@ class MainWindow(tk.Tk):
 
         # ── MANDATORY setup page (Task 1) ─────────────────────────────────────
         # Hide the main window and force the user to pick a save folder and an
-        # autosave interval before anything else is shown.
+        # autosave interval before anything else is shown — UNLESS the hub
+        # already provided that config (Task H3), in which case we apply it and
+        # skip the page entirely.
         self.alive = True
         self.withdraw()
-        if not self._run_setup_page():
-            self.alive = False
-            self.destroy()
-            return
+        if self._hub_config:
+            if not self._apply_hub_config():
+                self.alive = False
+                self.destroy()
+                return
+        else:
+            if not self._run_setup_page():
+                self.alive = False
+                self.destroy()
+                return
         self.deiconify()
         # Make sure the main window actually comes to the front (under Spyder it
         # can otherwise open behind the IDE or off-screen).
@@ -1597,7 +1823,8 @@ class MainWindow(tk.Tk):
         self.focus_force()
         self._reader     = SerialReader()
         self._reader.port = port
-        self._models     = {i: ExperimentModel(i) for i in range(1, 5)}
+        self._models     = {i: ExperimentModel(i)
+                            for i in range(1, self.num_boxes + 1)}
         self._arduino_ts = [0]
         self._connected  = False
         self._streaming  = False
@@ -1617,6 +1844,47 @@ class MainWindow(tk.Tk):
         self.after(WATCHDOG_MS, self._watchdog_tick)
         # Task 1/6: central autosave + full-view refresh on the X-minute cycle.
         self._schedule_central()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # HUB CONFIG (Task H1-H4) — used instead of the setup page when launched
+    # from the hub. Applies the per-instance folder layout and records the
+    # flashed Arduino sketch into this instance's settings file.
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _apply_hub_config(self) -> bool:
+        """Apply hub-provided folder/box/sketch config; returns True on success."""
+        cfg = self._hub_config
+        # data_folder is where autosaved per-box data is written (Task H3).
+        data_folder = cfg.get("data_folder") or cfg.get("instance_folder", "")
+        if data_folder:
+            try:
+                os.makedirs(data_folder, exist_ok=True)
+            except Exception as e:
+                print(f"[hub] could not create data folder: {e}")
+            self._folder_var.set(data_folder)
+            save_shared_value("save_folder", data_folder)
+            self._settings["shared"]["save_folder"] = data_folder
+
+        if cfg.get("autosave_minutes"):
+            try:
+                mins = float(cfg["autosave_minutes"])
+                if mins > 0:
+                    self._autosave_min_var.set(str(mins))
+                    save_shared_value("autosave_minutes", mins)
+                    self._settings["shared"]["autosave_minutes"] = mins
+            except (TypeError, ValueError):
+                pass
+
+        # Persist box count + flashed-sketch metadata into THIS instance's
+        # settings json (Task H2/H4) so each instance records its own.
+        save_shared_value("num_boxes", self.num_boxes)
+        self._settings["shared"]["num_boxes"] = self.num_boxes
+        if cfg.get("sketch_name") or cfg.get("sketch_path"):
+            save_shared_value("sketch_name", cfg.get("sketch_name", ""))
+            save_shared_value("sketch_path", cfg.get("sketch_path", ""))
+            self._settings["shared"]["sketch_name"] = cfg.get("sketch_name", "")
+            self._settings["shared"]["sketch_path"] = cfg.get("sketch_path", "")
+        return True
 
     # ══════════════════════════════════════════════════════════════════════════
     # MANDATORY SETUP PAGE (Task 1)
@@ -1786,6 +2054,8 @@ class MainWindow(tk.Tk):
                 except (ValueError, tk.TclError):
                     out[k] = self._settings["shared"]["plot"][k]
             out["load_yticks"] = int(out["load_yticks"])
+            if "load_show" in out:
+                out["load_show"] = int(round(out["load_show"]))
             return out
         return dict(self._settings["shared"]["plot"])
 
@@ -1925,11 +2195,12 @@ class MainWindow(tk.Tk):
         mon_tab   = tk.Frame(nb, bg=BG);  nb.add(mon_tab,   text="  Monitor  ")
         self._build_quad_tab(mon_tab)
 
-        # One full-experiment (imshow) tab per experiment (Task 3).
+        # One full-experiment (imshow) tab per box (Task 3 / H2). Labelled
+        # "Box N" (Task L5) and only as many as this instance drives.
         fp = self.full_settings()
-        for exp_id in range(1, 5):
+        for exp_id in range(1, self.num_boxes + 1):
             t = tk.Frame(nb, bg=BG)
-            nb.add(t, text=f"  Experiment {exp_id}  ")
+            nb.add(t, text=f"  Box {exp_id}  ")
             fv = FullViewPanel(
                 t, exp_id,
                 rows=fp["full_rows"],
@@ -1940,12 +2211,14 @@ class MainWindow(tk.Tk):
 
         cal_tab   = tk.Frame(nb, bg=BG);  nb.add(cal_tab,   text="  Calibration  ")
         flag_tab  = tk.Frame(nb, bg=BG);  nb.add(flag_tab,  text="  Flag Settings  ")
+        freport_tab = tk.Frame(nb, bg=BG); nb.add(freport_tab, text="  Flags Reported  ")
         vis_tab   = tk.Frame(nb, bg=BG);  nb.add(vis_tab,   text="  Raster Plot Visuals  ")
         data_tab  = tk.Frame(nb, bg=BG);  nb.add(data_tab,  text="  Data  ")
         term_tab  = tk.Frame(nb, bg=BG);  nb.add(term_tab,  text="  Terminal  ")
 
         self._build_cal_tab(cal_tab)
         self._build_flag_tab(flag_tab)
+        self._build_flags_reported_tab(freport_tab)   # Task F4
         self._build_visuals_tab(vis_tab)
         self._build_data_tab(data_tab)
         self._build_terminal_tab(term_tab)
@@ -2015,21 +2288,51 @@ class MainWindow(tk.Tk):
                                  font=FONTM, bg=BG_PNL, fg=FG_MUT)
         self._ts_lbl.pack(side=tk.RIGHT, padx=16)
 
+        # Task S1: rotating initialisation status shown during the post-stream
+        # 9-second lockout (run + calibration buttons disabled meanwhile).
+        self._init_lbl = tk.Label(parent, text="", font=FONTB,
+                                   bg=BG_PNL, fg=CLR_EXP)
+        self._init_lbl.pack(side=tk.RIGHT, padx=10)
+
     # ── Tab: Experiments (4 quadrants) ────────────────────────────────────────
 
     def _build_quad_tab(self, parent):
-        """Build the 2×2 grid of ExpQuadrant widgets for the Experiments tab."""
+        """Build the monitor grid of ExpQuadrant widgets (Task H2).
+
+        Layout depends on how many boxes this instance drives:
+          • 1 box  → a single quadrant fills the whole tab.
+          • 2-4    → a fixed 2×2 grid; the first N cells are populated and any
+                     remaining cells are left empty, so 3 boxes give 3 panes +
+                     1 blank, etc.
+        """
+        n = self.num_boxes
+        if n <= 1:
+            parent.columnconfigure(0, weight=1)
+            parent.rowconfigure(0, weight=1)
+            q = ExpQuadrant(parent, self._models[1],
+                            self._reader, self._arduino_ts, host=self)
+            q.grid(row=0, column=0, sticky="nsew", padx=3, pady=3)
+            self._quadrants.append(q)
+            return
+
+        # 2×2 grid, populate the first N cells (Task H2).
         parent.columnconfigure(0, weight=1)
         parent.columnconfigure(1, weight=1)
         parent.rowconfigure(0, weight=1)
         parent.rowconfigure(1, weight=1)
-
         positions = {1: (0, 0), 2: (0, 1), 3: (1, 0), 4: (1, 1)}
         for exp_id, (row, col) in positions.items():
-            q = ExpQuadrant(parent, self._models[exp_id],
-                            self._reader, self._arduino_ts, host=self)
-            q.grid(row=row, column=col, sticky="nsew", padx=3, pady=3)
-            self._quadrants.append(q)
+            if exp_id <= n:
+                q = ExpQuadrant(parent, self._models[exp_id],
+                                self._reader, self._arduino_ts, host=self)
+                q.grid(row=row, column=col, sticky="nsew", padx=3, pady=3)
+                self._quadrants.append(q)
+            else:
+                # Empty placeholder so the populated boxes keep their size.
+                tk.Frame(parent, bg=BG_PNL, highlightbackground=BG_ALT,
+                         highlightthickness=1
+                         ).grid(row=row, column=col, sticky="nsew",
+                                padx=3, pady=3)
 
     # ── Tab: Calibration ──────────────────────────────────────────────────────
 
@@ -2044,6 +2347,10 @@ class MainWindow(tk.Tk):
         sc.create_window((0, 0), window=body, anchor="nw")
         body.bind("<Configure>",
                   lambda e: sc.configure(scrollregion=sc.bbox("all")))
+
+        # Task S1: every calibration-action button is collected here so the
+        # 9-second post-stream lockout can disable them all together.
+        self._cal_lock_buttons = []
 
         def section(title, subtitle=""):
             """Create a labelled section card (title + optional subtitle + inner frame)."""
@@ -2064,10 +2371,11 @@ class MainWindow(tk.Tk):
             """Add one hardware-calibration row (label + button) to the calibration grid."""
             tk.Label(hw, text=label, font=FONT, bg=BG_PNL, fg=FG
                      ).grid(row=r, column=0, sticky="w", pady=5, padx=(0, 16))
-            tk.Button(hw, text=btn_text, font=FONTB,
-                      bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=8,
-                      command=cmd_fn
-                      ).grid(row=r, column=1, sticky="w", padx=4)
+            b = tk.Button(hw, text=btn_text, font=FONTB,
+                          bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=8,
+                          command=cmd_fn)
+            b.grid(row=r, column=1, sticky="w", padx=4)
+            self._cal_lock_buttons.append(b)
 
         hw_row(0, "Offset calibration — all channels, bottles must be empty:",
                "Send 'o'", lambda: self._reader.send("o"))
@@ -2083,10 +2391,11 @@ class MainWindow(tk.Tk):
         tk.Spinbox(hw, from_=0, to=7, textvariable=self._gcal_ch,
                    width=4, font=FONTM, bg=BG_ALT, fg=FG, relief=tk.FLAT
                    ).grid(row=2, column=1, sticky="w", padx=4)
-        tk.Button(hw, text="Send 'kg'", font=FONTB,
-                  bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=8,
-                  command=lambda: self._reader.send(f"k{self._gcal_ch.get()}g")
-                  ).grid(row=2, column=2, sticky="w", padx=4)
+        kgb = tk.Button(hw, text="Send 'kg'", font=FONTB,
+                        bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=8,
+                        command=lambda: self._reader.send(f"k{self._gcal_ch.get()}g"))
+        kgb.grid(row=2, column=2, sticky="w", padx=4)
+        self._cal_lock_buttons.append(kgb)
 
         # ── Touch thresholds ──────────────────────────────────────────────────
         th = section("Touch sensitivity thresholds",
@@ -2104,10 +2413,11 @@ class MainWindow(tk.Tk):
             tk.Spinbox(th, from_=20, to=255, textvariable=v, width=5,
                        font=FONTM, bg=BG_ALT, fg=FG, relief=tk.FLAT
                        ).grid(row=r, column=c * 3 + 1, padx=2)
-            tk.Button(th, text="Set", font=FONTB,
-                      bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=6,
-                      command=lambda ch=ch: self._set_threshold(ch)
-                      ).grid(row=r, column=c * 3 + 2, padx=4)
+            tb_btn = tk.Button(th, text="Set", font=FONTB,
+                               bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=6,
+                               command=lambda ch=ch: self._set_threshold(ch))
+            tb_btn.grid(row=r, column=c * 3 + 2, padx=4)
+            self._cal_lock_buttons.append(tb_btn)
 
         # ── Software load-cell calibration ────────────────────────────────────
         lc = section("Load cell software calibration",
@@ -2127,7 +2437,7 @@ class MainWindow(tk.Tk):
         cal_loaded = (self._settings.get("ports", {})
                       .get(self._reader.port, {}).get("calibration", {}))
         r = 1
-        for exp_id in range(1, 5):
+        for exp_id in range(1, self.num_boxes + 1):
             ch = EXPERIMENT_CHANNELS[exp_id]
             for side, load_id in (("Left",  ch["left_load"]),
                                    ("Right", ch["right_load"])):
@@ -2153,11 +2463,12 @@ class MainWindow(tk.Tk):
                              bg=BG_PNL, fg=FG, width=10
                              ).grid(row=r, column=3 + ci * 2, padx=4)
                     lbl_txt = "Snap 50g" if ci == 0 else "Snap Bottle"
-                    tk.Button(grid, text=lbl_txt, font=FONTB,
-                              bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=6,
-                              command=lambda k=key, sk=snap_key, lid=load_id:
-                                      self._snap(k, sk, lid)
-                              ).grid(row=r, column=4 + ci * 2, padx=2)
+                    snap_btn = tk.Button(grid, text=lbl_txt, font=FONTB,
+                                         bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=6,
+                                         command=lambda k=key, sk=snap_key,
+                                         lid=load_id: self._snap(k, sk, lid))
+                    snap_btn.grid(row=r, column=4 + ci * 2, padx=2)
+                    self._cal_lock_buttons.append(snap_btn)
 
                 ratio_init = csec.get(f"cal_{side_l}")
                 sv_r = tk.StringVar(
@@ -2210,20 +2521,43 @@ class MainWindow(tk.Tk):
                   command=self._apply_flag_settings
                   ).grid(row=len(rows), column=0, sticky="w", pady=(10, 0))
 
-        # ── Alerts log ────────────────────────────────────────────────────────
-        tk.Label(parent, text="Alerts log", font=FONTB, bg=BG, fg=FG
-                 ).pack(anchor="w", padx=16, pady=(6, 2))
+        tk.Label(parent,
+                 text="Reported flags now appear on the separate "
+                      "\"Flags Reported\" tab.",
+                 font=FONT, bg=BG, fg=FG_MUT
+                 ).pack(anchor="w", padx=16, pady=(10, 6))
+
+    # ── Tab: Flags Reported (Task F4) ─────────────────────────────────────────
+
+    def _build_flags_reported_tab(self, parent):
+        """Build the Flags Reported tab: the live alerts/flags log (Task F4).
+
+        This holds the log that previously lived under the Flag Settings tab.
+        emit_alert() writes to self._alert_text, which is created here.
+        """
+        tk.Label(parent, text="Flags Reported", font=FONTB, bg=BG, fg=FG
+                 ).pack(anchor="w", padx=16, pady=(12, 2))
+        tk.Label(parent,
+                 text="Every flag, resolution, autosave and error is logged "
+                      "here as it happens. Weight over/under flags report the "
+                      "size of the difference, and are followed by a "
+                      "\"resolved\" entry once the condition clears.",
+                 font=FONT, bg=BG, fg=FG_MUT, wraplength=900, justify="left"
+                 ).pack(anchor="w", padx=16, pady=(0, 6))
+
         self._alert_text = tk.Text(parent, bg=BG_PNL, fg=FG, font=FONTM,
                                    relief=tk.FLAT, state=tk.DISABLED,
-                                   wrap=tk.WORD, height=12)
+                                   wrap=tk.WORD)
         asb = ttk.Scrollbar(parent, orient=tk.VERTICAL,
                             command=self._alert_text.yview)
         self._alert_text.configure(yscrollcommand=asb.set)
         asb.pack(side=tk.RIGHT, fill=tk.Y)
         self._alert_text.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
-        self._alert_text.tag_configure("error", foreground=CLR_RED)
-        self._alert_text.tag_configure("flag",  foreground=CLR_EXP)
-        self._alert_text.tag_configure("info",  foreground=FG_MUT)
+        self._alert_text.tag_configure("error",    foreground=CLR_RED)
+        self._alert_text.tag_configure("flag",     foreground=CLR_EXP)
+        self._alert_text.tag_configure("warning",  foreground=CLR_EXP)
+        self._alert_text.tag_configure("resolved", foreground=CLR_GRN)
+        self._alert_text.tag_configure("info",     foreground=FG_MUT)
 
     # ── Tab: Raster Plot Visuals (Task 5) ─────────────────────────────────────
 
@@ -2270,6 +2604,34 @@ class MainWindow(tk.Tk):
                     ("load_ymax",   "Load axis maximum (g):"),
                     ("load_yticks", "Number of tick marks:"),
                 ])
+
+        # ── Load-cell display (Task V1 / LC27) ────────────────────────────────
+        tk.Label(body, text="Load-cell display", font=FONTB, bg=BG, fg=FG
+                 ).pack(anchor="w", padx=16, pady=(14, 1))
+        tk.Label(body, text="Toggle whether load-cell data is recorded and "
+                 "plotted at all (Task V1). When off, no load data is captured. "
+                 "Line width applies to the Box (full-view) tab load traces.",
+                 font=FONT, bg=BG, fg=FG_MUT, wraplength=900, justify="left"
+                 ).pack(anchor="w", padx=16, pady=(0, 4))
+        lf = tk.Frame(body, bg=BG_PNL, padx=16, pady=12)
+        lf.pack(fill=tk.X, padx=16, pady=(0, 4))
+        self._plot_vars["load_show"] = tk.StringVar(
+            value=str(plot.get("load_show", 1)))
+        tk.Checkbutton(lf, text="Show / record load-cell data",
+                       variable=self._plot_vars["load_show"],
+                       onvalue="1", offvalue="0",
+                       font=FONT, bg=BG_PNL, fg=FG, selectcolor=BG_ALT,
+                       activebackground=BG_PNL, activeforeground=FG
+                       ).grid(row=0, column=0, sticky="w", pady=5, padx=(0, 16))
+        tk.Label(lf, text="Box-tab load line width:", font=FONT,
+                 bg=BG_PNL, fg=FG).grid(row=1, column=0, sticky="w",
+                                        pady=5, padx=(0, 16))
+        self._plot_vars["load_linewidth"] = tk.StringVar(
+            value=str(plot.get("load_linewidth", 1.2)))
+        tk.Spinbox(lf, from_=0.1, to=10, increment=0.1,
+                   textvariable=self._plot_vars["load_linewidth"], width=8,
+                   font=FONTM, bg=BG_ALT, fg=FG, relief=tk.FLAT
+                   ).grid(row=1, column=1, sticky="w", padx=4)
 
         section("Monitor raster timing", "Controls the live 4-row quadrant view "
                 "on the Monitor tab (also settable at the top of the script).",
@@ -2394,13 +2756,18 @@ class MainWindow(tk.Tk):
         """Populate all GUI widgets from the settings loaded at startup (Task 3 round-trip)."""
         for q in self._quadrants:
             q.apply_plot_settings()
+        # Task V1: gate load capture on every model from the loaded setting.
+        self._apply_load_capture()
         # Full-view tabs: apply loaded geometry + load axis, then paint logs.
         fp = self.full_settings()
         pv = self.plot_settings()
+        show = bool(pv.get("load_show", 1))
+        lw   = float(pv.get("load_linewidth", 1.2))
         for exp_id, fv in getattr(self, "_fullviews", {}).items():
             fv.reconfigure(fp["full_rows"], fp["full_seconds_per_row"],
                            fp["full_bin_seconds"])
-            fv.set_load_axis(pv["load_ymin"], pv["load_ymax"])
+            fv.set_load_axis(pv["load_ymin"], pv["load_ymax"],
+                             show=show, linewidth=lw)
             fv.update_view(self._models[exp_id].get_log())
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -2410,8 +2777,9 @@ class MainWindow(tk.Tk):
     def emit_alert(self, exp_id, text: str, level: str = "flag"):
         """Show an alert in the GUI (alerts log + bottom banner) and terminal."""
         stamp = datetime.datetime.now().strftime("%H:%M:%S")
-        who   = "SYSTEM" if exp_id in (None, 0) else f"Exp {exp_id}"
-        tag   = "ERROR" if level == "error" else ("INFO" if level == "info" else "FLAG")
+        who   = "SYSTEM" if exp_id in (None, 0) else f"Box {exp_id}"
+        tag   = {"error": "ERROR", "info": "INFO",
+                 "resolved": "RESOLVED", "warning": "FLAG"}.get(level, "FLAG")
         line  = f"[{stamp}] [{who}] {tag}: {text}"
 
         # terminal
@@ -2427,8 +2795,14 @@ class MainWindow(tk.Tk):
 
         # bottom banner
         if hasattr(self, "_alert_banner"):
-            colour = CLR_RED if level == "error" else (
-                FG_MUT if level == "info" else CLR_EXP)
+            if level == "error":
+                colour = CLR_RED
+            elif level == "info":
+                colour = FG_MUT
+            elif level == "resolved":
+                colour = CLR_GRN
+            else:
+                colour = CLR_EXP
             self._alert_banner.config(text=line, fg=colour)
 
     def _watchdog_tick(self):
@@ -2439,8 +2813,8 @@ class MainWindow(tk.Tk):
                 now = self._arduino_ts[0]
                 cfg = self.flag_settings()
                 for exp_id, model in self._models.items():
-                    for f in model.check_flags(now, cfg):
-                        self.emit_alert(exp_id, f, level="flag")
+                    for fmsg, flvl in model.check_flags(now, cfg):
+                        self.emit_alert(exp_id, fmsg, level=flvl)
         except Exception as e:
             print(f"[watchdog] {e}")
         finally:
@@ -2497,11 +2871,58 @@ class MainWindow(tk.Tk):
             self._streaming = True
             self._stream_btn.config(text="⏹ Stop Arduino stream",
                                      bg=CLR_RED, activebackground="#CC3730")
+            self._begin_init_lockout()           # Task S1
         else:
             self._reader.send("s")
             self._streaming = False
             self._stream_btn.config(text="▶ Start Arduino stream",
                                      bg=CLR_GRN, activebackground="#25A244")
+            self._cancel_init_lockout()          # Task S1
+
+    # ── Task S1: post-stream initialisation lockout ──────────────────────────
+    def _begin_init_lockout(self):
+        """Lock run + calibration buttons for 9 s and rotate the init messages."""
+        self._set_controls_locked(True)
+        self._init_idx = 0
+        self._show_next_init_msg()
+        self._init_unlock_job = self.after(INIT_LOCKOUT_MS,
+                                           self._end_init_lockout)
+
+    def _show_next_init_msg(self):
+        """Advance the rotating initialisation message every 1.5 s."""
+        if self._init_idx < len(INIT_MSGS):
+            self._init_lbl.config(text=INIT_MSGS[self._init_idx])
+            self._init_idx += 1
+            self._init_msg_job = self.after(INIT_STEP_MS,
+                                            self._show_next_init_msg)
+
+    def _end_init_lockout(self):
+        """Re-enable run + calibration once the 9 s lockout elapses."""
+        self._set_controls_locked(False)
+        self._init_lbl.config(text=INIT_MSGS[-1])   # leave 'ready to lick'
+
+    def _cancel_init_lockout(self):
+        """Cancel any pending lockout (e.g. stream stopped early) and unlock."""
+        for attr in ("_init_unlock_job", "_init_msg_job"):
+            job = getattr(self, attr, None)
+            if job is not None:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self._set_controls_locked(False)
+        self._init_lbl.config(text="")
+
+    def _set_controls_locked(self, locked: bool):
+        """Enable/disable every Run + calibration button together (Task S1)."""
+        for q in self._quadrants:
+            q.set_run_locked(locked)
+        for b in getattr(self, "_cal_lock_buttons", []):
+            try:
+                b.config(state=(tk.DISABLED if locked else tk.NORMAL))
+            except Exception:
+                pass
 
     def _set_threshold(self, ch: int):
         """Validate and send the touch threshold for channel ch to the Arduino, then persist it."""
@@ -2582,6 +3003,15 @@ class MainWindow(tk.Tk):
         self._settings["shared"]["flags"].update(vals)
         self.emit_alert(None, "flag thresholds updated", level="info")
 
+    def _apply_load_capture(self):
+        """Push the load-show toggle to every model so capture honours V1."""
+        try:
+            show = bool(self.plot_settings().get("load_show", 1))
+        except Exception:
+            show = True
+        for m in self._models.values():
+            m.capture_load = show
+
     def _apply_plot_settings(self):
         """Validate and apply ALL Raster Plot Visuals settings: load-cell axis,
         monitor raster timing, and full-view grid geometry."""
@@ -2594,6 +3024,10 @@ class MainWindow(tk.Tk):
                 messagebox.showerror("Bad value", f"{k} must be a number.")
                 return
         vals["load_yticks"] = int(vals["load_yticks"])
+        if "load_show" in vals:
+            vals["load_show"] = int(round(vals["load_show"]))
+        if "load_linewidth" in vals:
+            vals["load_linewidth"] = max(0.1, float(vals["load_linewidth"]))
         if vals["load_ymax"] <= vals["load_ymin"]:
             messagebox.showerror("Bad axis", "Maximum must exceed minimum.")
             return
@@ -2615,16 +3049,22 @@ class MainWindow(tk.Tk):
         save_shared("plot", vals)                        # Task 3 persist
         self._settings["shared"]["plot"].update(vals)
 
+        # Task V1: gate load capture on every model.
+        self._apply_load_capture()
+
         # Live redraw: monitor quadrants pull load axis + monitor timing.
         for q in self._quadrants:                        # Task 2/5
             q.apply_plot_settings()
 
         # Live reconfigure: full-view tabs get the new grid + load axis + repaint.
         fp = self.full_settings()                        # Task 3
+        show = bool(vals.get("load_show", 1))
+        lw   = float(vals.get("load_linewidth", 1.2))
         for exp_id, fv in self._fullviews.items():
             fv.reconfigure(fp["full_rows"], fp["full_seconds_per_row"],
                            fp["full_bin_seconds"])
-            fv.set_load_axis(vals["load_ymin"], vals["load_ymax"])
+            fv.set_load_axis(vals["load_ymin"], vals["load_ymax"],
+                             show=show, linewidth=lw)
             fv.update_view(self._models[exp_id].get_log())
 
         self.emit_alert(None, "raster plot visuals updated", level="info")
@@ -2708,15 +3148,18 @@ class MainWindow(tk.Tk):
                     # ingest() returns a list of flag strings for load-cell events;
                     # forward each one to the alert banner immediately.
                     new_flags = model.ingest(ts, aid, amp)
-                    for flag_msg in (new_flags or []):
-                        # emit_alert must be called on the Tk main thread;
-                        # schedule it safely with after(0, ...).
-                        self.after(0, lambda msg=flag_msg, eid=model.exp_id:
-                                   self.emit_alert(eid, msg, level="warning"))
+                    for fmsg, flvl in (new_flags or []):
+                        # emit_alert must run on the Tk main thread.
+                        self.after(0, lambda msg=fmsg, eid=model.exp_id,
+                                   lvl=flvl: self.emit_alert(eid, msg, level=lvl))
 
     def _poll_ts_label(self):
-        """Update the timestamp label in the top strip every 500 ms."""
-        self._ts_lbl.config(text=f"ts: {self._arduino_ts[0]}")
+        """Update the timestamp label in the top strip every 500 ms (Task L14: H:MM:SS)."""
+        ts_ms = self._arduino_ts[0]
+        s = int(ts_ms // 1000)
+        h, rem = divmod(s, 3600)
+        m, sec = divmod(rem, 60)
+        self._ts_lbl.config(text=f"ts: {h:d}:{m:02d}:{sec:02d}")
         if self._connected:
             self.after(500, self._poll_ts_label)
 
@@ -2742,10 +3185,32 @@ class MainWindow(tk.Tk):
 
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    # Task 1: optional COM port from the command line pre-fills the Port box,
-    #         making it trivial to launch one instance per Arduino.
-    init_port = sys.argv[1] if len(sys.argv) > 1 else None
-    app = MainWindow(initial_port=init_port)
+    # Task 1 / H1-H4: launch modes.
+    #   • Standalone:  python lickometer_finalx6.py [COM_PORT]
+    #         The optional COM port pre-fills the Port box; the mandatory setup
+    #         page then asks for a save folder + autosave interval.
+    #   • From the hub: python lickometer_finalx6.py --config <config.json>
+    #         The JSON carries port, num_boxes, instance_folder, data_folder,
+    #         settings_file, autosave_minutes and the flashed sketch name/path.
+    #         The setup page is skipped and that config is applied directly.
+    init_port  = None
+    hub_config = None
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("--config", "-c") and len(argv) > 1:
+        try:
+            with open(argv[1], "r") as _f:
+                hub_config = json.load(_f)
+        except Exception as _e:
+            print(f"[hub] could not read config {argv[1]}: {_e}")
+            hub_config = None
+        if hub_config:
+            # Point settings at this instance's own file BEFORE the window builds
+            # so calibrations/visuals are unique per instance (Task H3).
+            set_settings_file(hub_config.get("settings_file", ""))
+    elif argv:
+        init_port = argv[0]
+
+    app = MainWindow(initial_port=init_port, hub_config=hub_config)
     # If the mandatory setup page was cancelled, __init__ already destroyed the
     # root window; only enter the main loop when the app is still alive.
     if getattr(app, "alive", True):
