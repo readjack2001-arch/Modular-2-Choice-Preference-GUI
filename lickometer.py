@@ -1,137 +1,59 @@
 """
-lickometer.py  —  Lickometer GUI system (single file)
-python lickometer.py
+lickometer_final.py  —  Lickometer GUI (single file)
+Run:   python lickometer_final.py
+Deps:  pip install pyserial matplotlib numpy
 
-Install:  pip install pyserial matplotlib numpy
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ARDUINO SERIAL PROTOCOL  (from lickometer_risha_final.ino)
 
-────────────────────────────────────────────────────────────────────────────────
-ARDUINO SERIAL PROTOCOL
-  The Arduino must send newline-terminated lines in these formats:
+  Every line during streaming:
+      timestamp_ms,id,amplitude
+      e.g.  14523,0,12.4    ← board-0 right load, 12.4 g
+            14650,8,1       ← ch-0 lick onset
+            14780,16,0      ← ch-0 lick offset
 
-    SENSOR,<pin_id>,<value>,<timestamp_ms>
-        Touch sensor pins  → value is 0 or 1  (boolean, 1 = touching)
-        Load cell pins     → value is a float  (raw ADC counts)
-    TS,<arduino_millis>
-        Heartbeat, sent every ~1 second
+  ID map:
+      0-7   load cells   (0=brd0-right, 1=brd0-left, 2=brd1-right … 7=brd3-left)
+      8-15  lick ONSET   (channels 0-7)
+      16-23 lick OFFSET  (channels 0-7, i.e. onset_id + 8)
 
-  Everything else is silently ignored (handy for debug prints).
-  Example:
-      SENSOR,CH0,1,14523      ← left lick channel of exp 1 just touched
-      SENSOR,CH4,12045.3,14523 ← left load cell of exp 1
-      TS,15000
+  Lines starting with '#' are comments/headers and are silently ignored.
+  Everything else that doesn't match  digits,digits,number  is ignored.
 
-────────────────────────────────────────────────────────────────────────────────
-EDIT THE SECTION MARKED "USER CONFIGURATION" BELOW — nowhere else needed.
-
-# ══════════════════════════════════════════════════════════════════════════════
-# USER CONFIGURATION  ← only section you need to touch
-# ══════════════════════════════════════════════════════════════════════════════
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Edit only the USER CONFIGURATION block below.
 """
-SERIAL_PORT       = "COM3"      # e.g. "/dev/ttyUSB0" on Linux/Mac
 
-TIMEBIN_MS        = 50          # raster bin width (ms)
-LOAD_CELL_POLL_MS = 50          # record load cell every N ms
-GUI_REFRESH_MS    = 5000        # raster redraws every N ms
-TIMESTAMP_POLL_MS = 1000        # Arduino heartbeat interval (ms) — informational
+# ══════════════════════════════════════════════════════════════════════════════
+# USER CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
 
-SECONDS_PER_ROW   = 60          # x-axis width of each raster row (seconds)
+SERIAL_PORT     = "COM3"       # Linux/Mac: "/dev/ttyUSB0" or "/dev/cu.usbserial-…"
+BAUD_RATE       = 115200
 
-# Spike heights in the raster plot
-SPIKE_HEIGHT_EXP  = 2           # onset / offset markers
-SPIKE_HEIGHT_LICK = 1           # lick onset / offset
+TIMEBIN_MS      = 50           # raster bin width in ms
+GUI_REFRESH_MS  = 1000         # raster redraw interval in ms
+SECONDS_PER_ROW = 60           # x-axis span per raster row (seconds)
 
-# Pin IDs — must match exactly what the Arduino sends as <pin_id>
-# Fill in your real channel names; placeholders shown here.
-EXPERIMENT_PINS = {
-    1: {"left_lick": "9",  "right_lick": "8",
-        "left_load": "1",  "right_load": "0"},
-    2: {"left_lick": "11",  "right_lick": "10",
-        "left_load": "3",  "right_load": "2"},
-    3: {"left_lick": "13",  "right_lick": "12",
-        "left_load": "5", "right_load": "4"},
-    4: {"left_lick": "15", "right_lick": "14",
-        "left_load": "7", "right_load": "6"},
+# Map experiment 1-4 to Arduino channel IDs.
+#   left/right lick onset IDs are 8-15; offset = onset + 8
+#   load cell IDs are 0-7
+#   Board 0 → Exp 1, Board 1 → Exp 2, etc.
+#   right spout → even channel; left spout → odd channel
+EXPERIMENT_CHANNELS = {
+    1: {"left_onset": 9,  "right_onset": 8,  "left_load": 1, "right_load": 0},
+    2: {"left_onset": 11, "right_onset": 10, "left_load": 3, "right_load": 2},
+    3: {"left_onset": 13, "right_onset": 12, "left_load": 5, "right_load": 4},
+    4: {"left_onset": 15, "right_onset": 14, "left_load": 7, "right_load": 6},
 }
-"""// events
-// 0 = board 0 right load (0)
-// 1 = board 0 left load (1)
-// 2 = board 1 right load (2)
-// 3 = board 1 left load (3)
-// 4 = board 2 right load (4)
-// 5 = board 2 left load (5)
-// 6 = board 3 right load (6)
-// 7 = board 3 left load (7)
-// 8/16 = board 0 right spout (0)
-// 9/17 = board 0 left spout (1)
-// 10/18 = board 1 right spout (2)
-// 11/19 = board 1 left spout (3)
-// 12/20 = board 2 right spout (4)
-// 13/21 = board 2 left spout (5)
-// 14/22 = board 3 right spout(6)
-// 15/23 = board 3 left spout (7)"""
+
 # ══════════════════════════════════════════════════════════════════════════════
 # END USER CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Event IDs (do not change — they define the saved .npy schema) ─────────────
-EVT_EXP_ONSET      = 0
-EVT_EXP_OFFSET     = 1
-EVT_LEFT_LICK_ON   = 2
-EVT_LEFT_LICK_OFF  = 3
-EVT_RIGHT_LICK_ON  = 4
-EVT_RIGHT_LICK_OFF = 5
-EVT_LEFT_LOAD      = 6
-EVT_RIGHT_LOAD     = 7
-
-EVENT_NAMES = {
-    EVT_EXP_ONSET:      "Experiment onset",
-    EVT_EXP_OFFSET:     "Experiment offset",
-    EVT_LEFT_LICK_ON:   "Left lick onset",
-    EVT_LEFT_LICK_OFF:  "Left lick offset",
-    EVT_RIGHT_LICK_ON:  "Right lick onset",
-    EVT_RIGHT_LICK_OFF: "Right lick offset",
-    EVT_LEFT_LOAD:      "Left load cell",
-    EVT_RIGHT_LOAD:     "Right load cell",
-}
-
-EVENT_TAGS = {
-    EVT_EXP_ONSET:      "exp",
-    EVT_EXP_OFFSET:     "exp",
-    EVT_LEFT_LICK_ON:   "left",
-    EVT_LEFT_LICK_OFF:  "left",
-    EVT_RIGHT_LICK_ON:  "right",
-    EVT_RIGHT_LICK_OFF: "right",
-    EVT_LEFT_LOAD:      "load",
-    EVT_RIGHT_LOAD:     "load",
-}
-
-# ── Palette ────────────────────────────────────────────────────────────────────
-BG_MAIN    = "#FFFFFF"
-BG_PANEL   = "#F1EFE8"
-BG_CARD    = "#FFFFFF"
-CLR_DARK   = "#2C2C2A"
-CLR_MUTED  = "#888780"
-CLR_GREEN  = "#3B6D11"
-CLR_RED    = "#D85A30"
-CLR_BLUE   = "#185FA5"
-CLR_ROW_ALT = "#F1EFE8"
-
-FONT_UI    = ("Segoe UI", 9)
-FONT_BOLD  = ("Segoe UI", 9, "bold")
-FONT_MONO  = ("Courier New", 10)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# IMPORTS
-# ══════════════════════════════════════════════════════════════════════════════
-
-import threading
-import queue
-import time
-import re
-import datetime
-import os
+import threading, queue, time, re, datetime, os
+from typing import List, Optional, Dict, Tuple
 from dataclasses import dataclass
-from typing import List, Optional
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -141,52 +63,77 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 import numpy as np
 
 try:
-    import serial
+    import serial as _serial
     _SERIAL_OK = True
 except ImportError:
     _SERIAL_OK = False
+
+# ── Derived ────────────────────────────────────────────────────────────────────
+BINS_PER_ROW = (SECONDS_PER_ROW * 1000) // TIMEBIN_MS  # 1200 at defaults
+
+# ── Palette (dark theme) ───────────────────────────────────────────────────────
+BG      = "#1C1C1E"
+BG_PNL  = "#2C2C2E"
+BG_ALT  = "#3A3A3C"
+FG      = "#F2F2F7"
+FG_MUT  = "#8E8E93"
+CLR_L   = "#FF6B6B"   # left lick / left load
+CLR_R   = "#4DA6FF"   # right lick / right load
+CLR_EXP = "#FFD60A"   # onset/offset markers
+CLR_GRN = "#30D158"
+CLR_RED = "#FF453A"
+
+FONT    = ("Segoe UI", 9)
+FONTB   = ("Segoe UI", 9, "bold")
+FONTM   = ("Courier New", 9)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SERIAL READER
 # ══════════════════════════════════════════════════════════════════════════════
 
-_SENSOR_RE = re.compile(r"^SENSOR,(\w+),([\d.+-]+),(\d+)$")
-_TS_RE     = re.compile(r"^TS,(\d+)$")
+_EVT_RE = re.compile(r"^(\d+),(\d+),([\d.+-]+)$")
 
 
 class SerialReader:
     """
-    Daemon thread that reads from the Arduino serial port.
-    Pushes parsed dicts onto self.queue:
-        {"type": "sensor", "pin": str, "value": float, "ts": int}
-        {"type": "ts",     "ts": int}
-    Falls back to simulation mode if pyserial is unavailable or port fails.
+    Background thread reads Arduino serial output.
+    Parsed events  → self.queue       {"ts":int,"id":int,"amp":float}
+    Raw text lines → self.raw_queue   str   (for the terminal tab)
+    Falls back to simulation if pyserial missing or port fails.
     """
 
-    def __init__(self, port: str, baudrate: int = 115200):
-        self.port     = port
-        self.baudrate = baudrate
-        self.queue    = queue.Queue()
-        self._ser     = None
-        self._running = False
-        self.sim_mode = False
+    def __init__(self):
+        self.queue     = queue.Queue()
+        self.raw_queue = queue.Queue(maxsize=500)
+        self._ser      = None
+        self._running  = False
+        self.sim_mode  = False
+        self.port      = SERIAL_PORT
+        self.baud      = BAUD_RATE
 
     def connect(self) -> bool:
         if not _SERIAL_OK:
-            self._start_sim()
+            #self._start_sim()
+            print("not okay")
             return False
         try:
-            self._ser     = serial.Serial(self.port, self.baudrate, timeout=1)
+            self._ser     = _serial.Serial(self.port, self.baud, timeout=1)
             self._running = True
             threading.Thread(target=self._read_loop, daemon=True).start()
             return True
         except Exception as e:
-            print(f"[SerialReader] {e}")
+            print(f"[Serial] {e}")
             self._start_sim()
             return False
+
+    def send(self, cmd: str):
+        if self._ser and self._ser.is_open:
+            self._ser.write((cmd + "\r\n").encode())
+        self._push_raw(f">> {cmd}")
 
     def disconnect(self):
         self._running = False
@@ -196,27 +143,39 @@ class SerialReader:
             except Exception:
                 pass
 
+    # ── Internal ──────────────────────────────────────────────────────────────
+
     def _read_loop(self):
         while self._running:
             try:
                 raw = self._ser.readline()
-                if raw:
-                    msg = self._parse(raw.decode("utf-8", errors="ignore").strip())
-                    if msg:
-                        self.queue.put(msg)
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", errors="ignore").strip()
+                self._push_raw(line)
+                msg = self._parse(line)
+                if msg:
+                    self.queue.put(msg)
             except Exception as e:
-                print(f"[SerialReader] read error: {e}")
+                print(f"[Serial] {e}")
                 time.sleep(0.1)
 
     def _parse(self, line: str):
-        m = _SENSOR_RE.match(line)
+        if line.startswith("#"):
+            return None
+        m = _EVT_RE.match(line)
         if m:
-            return {"type": "sensor", "pin": m.group(1),
-                    "value": float(m.group(2)), "ts": int(m.group(3))}
-        m = _TS_RE.match(line)
-        if m:
-            return {"type": "ts", "ts": int(m.group(1))}
+            return {"ts": int(m.group(1)), "id": int(m.group(2)),
+                    "amp": float(m.group(3))}
         return None
+
+    def _push_raw(self, line: str):
+        try:
+            self.raw_queue.put_nowait(line)
+        except queue.Full:
+            pass
+
+    # ── Simulation ────────────────────────────────────────────────────────────
 
     def _start_sim(self):
         self.sim_mode = True
@@ -224,52 +183,66 @@ class SerialReader:
         threading.Thread(target=self._sim_loop, daemon=True).start()
 
     def _sim_loop(self):
-        """
-        Simulates 4 experiments × (left touch, right touch, left load, right load).
-        Touch pins send 0 or 1.  Load pins send a slow drifting float.
-        """
         import random, math
-        t_ms = 0
-        # build flat list of all pins
-        touch_pins = []
-        load_pins  = []
-        for exp_id in range(1, 5):
-            p = EXPERIMENT_PINS[exp_id]
-            touch_pins += [p["left_lick"], p["right_lick"]]
-            load_pins  += [p["left_load"], p["right_load"]]
-
-        lick_state    = {p: 0   for p in touch_pins}  # 0 or 1
-        lick_duration = {p: 0   for p in touch_pins}  # ms remaining in lick
+        t         = 0
+        lick_on   = {i: False for i in range(8)}
+        lick_rem  = {i: 0     for i in range(8)}
+        load_base = [12000, 11500, 13000, 12800, 11200, 13500, 12200, 11800]
+        load_tick = 0
 
         while self._running:
-            t_ms += 50
-            for pin in touch_pins:
-                if lick_state[pin] == 1:
-                    lick_duration[pin] -= 50
-                    if lick_duration[pin] <= 0:
-                        lick_state[pin] = 0
+            t += 50
+            for ch in range(8):
+                on_id  = 8  + ch
+                off_id = 16 + ch
+                if lick_on[ch]:
+                    lick_rem[ch] -= 50
+                    if lick_rem[ch] <= 0:
+                        lick_on[ch] = False
+                        msg = {"ts": t, "id": off_id, "amp": 0.0}
+                        self.queue.put(msg)
+                        self._push_raw(f"{t},{off_id},0")
                 else:
-                    if random.random() < 0.02:          # 2% chance of lick per 50 ms
-                        lick_state[pin]    = 1
-                        lick_duration[pin] = random.randint(100, 600)
-                self.queue.put({"type": "sensor", "pin": pin,
-                                "value": float(lick_state[pin]), "ts": t_ms})
+                    if random.random() < 0.015:
+                        lick_on[ch]  = True
+                        lick_rem[ch] = random.randint(100, 700)
+                        msg = {"ts": t, "id": on_id, "amp": 1.0}
+                        self.queue.put(msg)
+                        self._push_raw(f"{t},{on_id},1")
 
-            for i, pin in enumerate(load_pins):
-                base = 10000 + i * 1500
-                val  = base + math.sin(t_ms / 8000) * 300 + random.gauss(0, 8)
-                self.queue.put({"type": "sensor", "pin": pin,
-                                "value": round(val, 1), "ts": t_ms})
-
-            if t_ms % 1000 == 0:
-                self.queue.put({"type": "ts", "ts": t_ms})
+            load_tick += 50
+            if load_tick >= 200:
+                load_tick = 0
+                for ld in range(8):
+                    val = load_base[ld] + math.sin(t / 9000) * 400 + random.gauss(0, 12)
+                    self.queue.put({"ts": t, "id": ld, "amp": round(val, 1)})
+                    self._push_raw(f"{t},{ld},{val:.1f}")
 
             time.sleep(0.05)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# EXPERIMENT MODEL
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ══════════════════════════════════════════════════════════════════════════════
-# EXPERIMENT MODEL  (data / logic — no GUI)
-# ══════════════════════════════════════════════════════════════════════════════
+# Internal event IDs (saved to .npy — independent of Arduino IDs)
+_EXP_ONSET  = 0;  _EXP_OFFSET  = 1
+_L_ON       = 2;  _L_OFF       = 3
+_R_ON       = 4;  _R_OFF       = 5
+_L_LOAD     = 6;  _R_LOAD      = 7
+
+_EVT_NAME = {
+    _EXP_ONSET: "Exp onset",   _EXP_OFFSET: "Exp offset",
+    _L_ON:      "L lick ON",   _L_OFF:      "L lick OFF",
+    _R_ON:      "R lick ON",   _R_OFF:      "R lick OFF",
+    _L_LOAD:    "L load",      _R_LOAD:     "R load",
+}
+_EVT_TAG = {
+    _EXP_ONSET: "exp",  _EXP_OFFSET: "exp",
+    _L_ON:      "left", _L_OFF:      "left",
+    _R_ON:      "right",_R_OFF:      "right",
+    _L_LOAD:    "load", _R_LOAD:     "load",
+}
+
 
 @dataclass
 class EventRow:
@@ -279,320 +252,312 @@ class EventRow:
 
 
 class ExperimentModel:
-    """
-    Per-experiment state and event log.
-
-    Touch sensor input is BOOLEAN (0 or 1):
-      • First 1 after a 0  → lick onset  (amplitude = 1)
-      • First 0 after a 1  → lick offset (amplitude = 1)
-
-    Load cell input is a raw float multiplied by the calibration ratio.
-    Recording is throttled to LOAD_CELL_POLL_MS.
-    """
-
     def __init__(self, exp_id: int):
         self.exp_id = exp_id
-        self.pins   = EXPERIMENT_PINS[exp_id]
+        ch = EXPERIMENT_CHANNELS[exp_id]
+        self.l_on_id   = ch["left_onset"]
+        self.r_on_id   = ch["right_onset"]
+        self.l_off_id  = self.l_on_id  + 8
+        self.r_off_id  = self.r_on_id  + 8
+        self.l_load_id = ch["left_load"]
+        self.r_load_id = ch["right_load"]
 
-        # Load cell calibration ratios (set from snap UI)
-        self.cal_left_load:  float = 1.0
-        self.cal_right_load: float = 1.0
+        self.cal_left:  float = 1.0
+        self.cal_right: float = 1.0
 
-        # Touch state: track previous boolean value to detect edges
-        self._prev_left:  int = 0
-        self._prev_right: int = 0
-
-        # Load cell poll throttle
-        self._last_load_ms: int = -1
-
-        # Event log
         self._log:  List[EventRow] = []
         self._lock  = threading.Lock()
+        self.running:  bool          = False
+        self.start_ts: Optional[int] = None
 
-        self.running:   bool          = False
-        self.start_ts:  Optional[int] = None
+    def owns(self, aid: int) -> bool:
+        return aid in (self.l_on_id, self.r_on_id,
+                       self.l_off_id, self.r_off_id,
+                       self.l_load_id, self.r_load_id)
 
-    # ── Event log ──────────────────────────────────────────────────────────────
+    def elapsed(self, ts: int) -> int:
+        return max(0, ts - self.start_ts) if self.start_ts is not None else 0
 
-    def add_event(self, ts_ms: int, event_id: int, amplitude: float = 0.0):
+    def add(self, ts_ms: int, eid: int, amp: float = 0.0):
         with self._lock:
-            self._log.append(EventRow(ts_ms, event_id, amplitude))
+            self._log.append(EventRow(ts_ms, eid, amp))
 
-    def get_log_copy(self) -> List[EventRow]:
+    def get_log(self) -> List[EventRow]:
         with self._lock:
             return list(self._log)
 
     def export_npy(self, path: str):
-        log = self.get_log_copy()
+        log = self.get_log()
         if not log:
             return
         arr = np.array(
             [(r.timestamp_ms, r.event_id, r.amplitude) for r in log],
             dtype=[("timestamp_ms", np.int64),
                    ("event_id",     np.int8),
-                   ("amplitude",    np.float32)],
-        )
+                   ("amplitude",    np.float32)])
         np.save(path, arr)
 
-    def elapsed_ms(self, arduino_ts: int) -> int:
-        return max(0, arduino_ts - self.start_ts) if self.start_ts is not None else 0
-
-    # ── Touch (boolean) lick detection ────────────────────────────────────────
-
-    def process_touch(self, pin: str, value: float, arduino_ts: int):
-        """
-        value must be 0 or 1.
-        Logs onset on first 1, offset on first 0 after 1.
-        Amplitude is always 1.
-        """
+    def ingest(self, ts: int, aid: int, amp: float):
         if not self.running:
             return
-        elapsed = self.elapsed_ms(arduino_ts)
-        v = int(round(value))   # coerce to 0 / 1
+        el = self.elapsed(ts)
+        if   aid == self.l_on_id:  self.add(el, _L_ON,  1.0)
+        elif aid == self.l_off_id: self.add(el, _L_OFF, 1.0)
+        elif aid == self.r_on_id:  self.add(el, _R_ON,  1.0)
+        elif aid == self.r_off_id: self.add(el, _R_OFF, 1.0)
+        elif aid == self.l_load_id:self.add(el, _L_LOAD, amp * self.cal_left)
+        elif aid == self.r_load_id:self.add(el, _R_LOAD, amp * self.cal_right)
 
-        is_left  = (pin == self.pins["left_lick"])
-        is_right = (pin == self.pins["right_lick"])
-
-        if is_left:
-            if v == 1 and self._prev_left == 0:
-                self.add_event(elapsed, EVT_LEFT_LICK_ON,  1.0)
-            elif v == 0 and self._prev_left == 1:
-                self.add_event(elapsed, EVT_LEFT_LICK_OFF, 1.0)
-            self._prev_left = v
-
-        elif is_right:
-            if v == 1 and self._prev_right == 0:
-                self.add_event(elapsed, EVT_RIGHT_LICK_ON,  1.0)
-            elif v == 0 and self._prev_right == 1:
-                self.add_event(elapsed, EVT_RIGHT_LICK_OFF, 1.0)
-            self._prev_right = v
-
-    # ── Load cell ──────────────────────────────────────────────────────────────
-
-    def process_load_cell(self, pin: str, value: float, arduino_ts: int):
-        if not self.running:
-            return
-        elapsed = self.elapsed_ms(arduino_ts)
-
-        # Throttle to LOAD_CELL_POLL_MS
-        if self._last_load_ms >= 0 and (elapsed - self._last_load_ms) < LOAD_CELL_POLL_MS:
-            return
-        self._last_load_ms = elapsed
-
-        if pin == self.pins["left_load"]:
-            self.add_event(elapsed, EVT_LEFT_LOAD,  value * self.cal_left_load)
-        elif pin == self.pins["right_load"]:
-            self.add_event(elapsed, EVT_RIGHT_LOAD, value * self.cal_right_load)
-
-    # ── Lifecycle ──────────────────────────────────────────────────────────────
-
-    def start(self, arduino_ts: int):
+    def start(self, ts: int):
         with self._lock:
             self._log.clear()
-        self._prev_left    = 0
-        self._prev_right   = 0
-        self._last_load_ms = -1
-        self.start_ts      = arduino_ts
-        self.running       = True
-        self.add_event(0, EVT_EXP_ONSET)
+        self.start_ts = ts
+        self.running  = True
+        self.add(0, _EXP_ONSET)
 
-    def stop(self, arduino_ts: int):
+    def stop(self, ts: int):
         if self.running:
             self.running = False
-            self.add_event(self.elapsed_ms(arduino_ts), EVT_EXP_OFFSET)
-
+            self.add(self.elapsed(ts), _EXP_OFFSET)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RASTER CANVAS
+# RASTER PANEL
 # ══════════════════════════════════════════════════════════════════════════════
 
-BINS_PER_ROW = (SECONDS_PER_ROW * 1000) // TIMEBIN_MS   # e.g. 1200
-
-
-class RasterCanvas:
+class RasterPanel:
     """
-    Matplotlib raster-plot embedded in a Tk widget.
-    X = time within each minute (50 ms bins).
-    Y = minute rows, growing dynamically.
+    Matplotlib raster embedded in a Tk widget for one experiment.
+
+    Lick events → filled BLOCKS from onset to offset (no gaps between bins).
+    Load cell   → translucent shaded area + line, superimposed on top.
+    Rows grow dynamically as recording extends past each minute.
     """
 
-    def __init__(self, parent: tk.Widget):
-        self._fig, self._ax = plt.subplots(figsize=(14, 3), dpi=96)
-        self._fig.patch.set_facecolor("white")
-        self._setup_axes()
-        embed = FigureCanvasTkAgg(self._fig, master=parent)
-        embed.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        self._embed = embed
-
-    def _setup_axes(self):
-        ax = self._ax
-        ax.set_facecolor("white")
-        ax.set_xlabel("Time within minute  (s)", fontsize=9, color="#444441")
-        ax.set_ylabel("Minute", fontsize=9, color="#444441")
-        x_ticks  = np.arange(0, BINS_PER_ROW + 1, (10_000) // TIMEBIN_MS)
-        x_labels = [str(int(t * TIMEBIN_MS / 1000)) for t in x_ticks]
-        ax.set_xticks(x_ticks)
-        ax.set_xticklabels(x_labels, fontsize=7)
-        ax.set_xlim(0, BINS_PER_ROW)
-        ax.tick_params(axis="y", labelsize=7)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.spines["left"].set_color("#D3D1C7")
-        ax.spines["bottom"].set_color("#D3D1C7")
-        ax.legend(handles=[
-            mpatches.Patch(color=CLR_DARK, label="Exp onset/offset"),
-            mpatches.Patch(color=CLR_RED,  label="Left lick"),
-            mpatches.Patch(color=CLR_BLUE, label="Right lick"),
-        ], loc="upper right", fontsize=7, framealpha=0.6)
+    def __init__(self, parent: tk.Widget, exp_id: int):
+        self.exp_id = exp_id
+        self._fig   = Figure(figsize=(6, 2.6), dpi=96, facecolor=BG_PNL)
+        self._ax    = self._fig.add_subplot(111)
+        self._fig.subplots_adjust(left=0.06, right=0.99, top=0.90, bottom=0.20)
+        self._canvas = FigureCanvasTkAgg(self._fig, master=parent)
+        self._canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._style_ax(self._ax, 1)
+        self._canvas.draw_idle()
 
     def update(self, events: List[EventRow]):
         ax = self._ax
         ax.cla()
-        self._setup_axes()
 
         if not events:
-            self._embed.draw_idle()
+            self._style_ax(ax, 1)
+            self._canvas.draw_idle()
             return
 
         max_ms = max(e.timestamp_ms for e in events)
         n_rows = max(1, int(np.ceil(max_ms / (SECONDS_PER_ROW * 1000))))
+        self._style_ax(ax, n_rows)
 
+        # Alternating row backgrounds
         for r in range(n_rows):
             if r % 2 == 1:
-                ax.axhspan(r, r + 1, color=CLR_ROW_ALT, zorder=0)
+                ax.axhspan(r, r + 1, color=BG_ALT, zorder=0, linewidth=0)
 
+        # ── Filled lick blocks ─────────────────────────────────────────────────
+        for on_eid, off_eid, color in ((_L_ON, _L_OFF, CLR_L),
+                                        (_R_ON, _R_OFF, CLR_R)):
+            on_times  = sorted(e.timestamp_ms for e in events if e.event_id == on_eid)
+            off_times = sorted(e.timestamp_ms for e in events if e.event_id == off_eid)
+
+            off_pool = list(off_times)
+            pairs: List[Tuple[int, int]] = []
+            for on in on_times:
+                nxt = next((o for o in off_pool if o >= on), None)
+                if nxt is None:
+                    nxt = on + TIMEBIN_MS       # still touching → 1 bin minimum
+                else:
+                    off_pool.remove(nxt)
+                pairs.append((on, nxt))
+
+            for on_ms, off_ms in pairs:
+                t = on_ms
+                row_ms = SECONDS_PER_ROW * 1000
+                while t < off_ms:
+                    row     = t // row_ms
+                    row_end = (row + 1) * row_ms
+                    seg_end = min(off_ms, row_end)
+                    x0 = (t       % row_ms) / TIMEBIN_MS
+                    x1 = (seg_end % row_ms) / TIMEBIN_MS
+                    if x1 == 0:
+                        x1 = BINS_PER_ROW        # segment ends at row boundary
+                    ax.fill_betweenx([row, row + 0.78],
+                                     x0, x1,
+                                     color=color, alpha=0.92,
+                                     linewidth=0, zorder=3)
+                    t = seg_end
+
+        # ── Experiment onset / offset markers ──────────────────────────────────
+        row_ms = SECONDS_PER_ROW * 1000
         for evt in events:
-            row_ms = SECONDS_PER_ROW * 1000
-            row    = int(evt.timestamp_ms // row_ms)
-            bin_x  = int((evt.timestamp_ms % row_ms) // TIMEBIN_MS)
-            color, height = self._style(evt.event_id)
-            ax.plot([bin_x, bin_x], [row, row + height * 0.45],
-                    color=color, linewidth=0.8, alpha=0.85, zorder=2)
+            if evt.event_id not in (_EXP_ONSET, _EXP_OFFSET):
+                continue
+            row   = evt.timestamp_ms // row_ms
+            bin_x = (evt.timestamp_ms % row_ms) // TIMEBIN_MS
+            ax.plot([bin_x, bin_x], [row, row + 0.95],
+                    color=CLR_EXP, linewidth=1.8, zorder=5)
+
+        # ── Load cell area plots ───────────────────────────────────────────────
+        for load_eid, color in ((_L_LOAD, CLR_L), (_R_LOAD, CLR_R)):
+            evts = [e for e in events if e.event_id == load_eid]
+            if len(evts) < 2:
+                continue
+            amps = np.array([e.amplitude for e in evts])
+            mn, mx = amps.min(), amps.max()
+            if mx == mn:
+                continue
+            norm = (amps - mn) / (mx - mn)
+
+            by_row: Dict[int, List[Tuple[float, float]]] = {}
+            for e, n in zip(evts, norm):
+                r  = e.timestamp_ms // row_ms
+                bx = (e.timestamp_ms % row_ms) / TIMEBIN_MS
+                by_row.setdefault(r, []).append((bx, n))
+
+            for r, pts in by_row.items():
+                xs = np.array([p[0] for p in pts])
+                ys = np.array([p[1] for p in pts]) * 0.65 + r
+                ax.fill_between(xs, r, ys,
+                                color=color, alpha=0.18, linewidth=0, zorder=2)
+                ax.plot(xs, ys, color=color, alpha=0.50,
+                        linewidth=0.9, zorder=2)
+
+        self._canvas.draw_idle()
+
+    def save_png(self, path: str):
+        self._fig.savefig(path, dpi=150, bbox_inches="tight",
+                          facecolor=self._fig.get_facecolor())
+
+    def _style_ax(self, ax, n_rows: int):
+        ax.set_facecolor(BG_PNL)
+        for sp in ax.spines.values():
+            sp.set_color(BG_ALT)
+        ax.tick_params(colors=FG_MUT, labelsize=6)
+
+        x_ticks  = np.arange(0, BINS_PER_ROW + 1, 10_000 // TIMEBIN_MS)
+        x_labels = [str(int(t * TIMEBIN_MS / 1000)) for t in x_ticks]
+        ax.set_xticks(x_ticks)
+        ax.set_xticklabels(x_labels, fontsize=6, color=FG_MUT)
+        ax.set_xlim(0, BINS_PER_ROW)
+        ax.set_xlabel("s", fontsize=6, color=FG_MUT, labelpad=1)
 
         ax.set_ylim(0, n_rows)
         ax.set_yticks(np.arange(n_rows) + 0.5)
-        ax.set_yticklabels([f"min {r+1}" for r in range(n_rows)], fontsize=7)
-        self._fig.set_size_inches(14, max(3, n_rows * 1.4))
-        self._embed.draw_idle()
+        ax.set_yticklabels([f"m{r + 1}" for r in range(n_rows)],
+                           fontsize=6, color=FG_MUT)
 
-    def _style(self, event_id: int):
-        if event_id in (EVT_EXP_ONSET, EVT_EXP_OFFSET):
-            return CLR_DARK, SPIKE_HEIGHT_EXP
-        elif event_id in (EVT_LEFT_LICK_ON, EVT_LEFT_LICK_OFF):
-            return CLR_RED, SPIKE_HEIGHT_LICK
-        elif event_id in (EVT_RIGHT_LICK_ON, EVT_RIGHT_LICK_OFF):
-            return CLR_BLUE, SPIKE_HEIGHT_LICK
-        else:
-            return CLR_MUTED, 0.3   # load cell ticks
-
-    def save_png(self, path: str):
-        self._fig.savefig(path, dpi=150, bbox_inches="tight")
+        ax.set_title(f"Exp {self.exp_id}", fontsize=8, color=FG,
+                     pad=3, loc="left")
+        ax.legend(
+            handles=[
+                mpatches.Patch(color=CLR_L,          label="L lick"),
+                mpatches.Patch(color=CLR_R,          label="R lick"),
+                mpatches.Patch(color=CLR_L, alpha=.4, label="L load"),
+                mpatches.Patch(color=CLR_R, alpha=.4, label="R load"),
+                mpatches.Patch(color=CLR_EXP,        label="Onset/Off"),
+            ],
+            loc="upper right", fontsize=5, framealpha=0.25,
+            facecolor=BG_PNL, edgecolor=BG_ALT, labelcolor=FG,
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# EXPERIMENT WINDOW
+# EXPERIMENT QUADRANT  (one of four panes in the main view)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class ExperimentWindow(tk.Toplevel):
-    """One window per experiment. All 4 can be open simultaneously."""
-
-    def __init__(self, master, model: ExperimentModel, arduino_ts: list):
-        super().__init__(master)
-        self.model       = model
-        self._arduino_ts = arduino_ts   # mutable [int] shared with dispatcher
+class ExpQuadrant(tk.Frame):
+    def __init__(self, master, model: ExperimentModel,
+                 reader: SerialReader, arduino_ts: list):
+        super().__init__(master, bg=BG_PNL,
+                         highlightbackground=BG_ALT, highlightthickness=1)
+        self.model        = model
+        self._reader      = reader
+        self._arduino_ts  = arduino_ts
         self._refresh_job = None
-
-        self.title(f"Experiment {model.exp_id}  —  Lickometer")
-        self.geometry("1280x760")
-        self.configure(bg=BG_MAIN)
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._shown       = 0
         self._build()
 
     def _build(self):
-        # ── Top bar ────────────────────────────────────────────────────────────
-        top = tk.Frame(self, bg=BG_PANEL, pady=6)
-        top.pack(fill=tk.X)
+        # Top bar
+        top = tk.Frame(self, bg=BG_PNL, pady=3)
+        top.pack(fill=tk.X, padx=4)
 
         tk.Label(top, text=f"Experiment {self.model.exp_id}",
-                 font=("Segoe UI", 11, "bold"),
-                 bg=BG_PANEL, fg=CLR_DARK).pack(side=tk.LEFT, padx=16)
+                 font=FONTB, bg=BG_PNL, fg=FG).pack(side=tk.LEFT, padx=6)
 
         self._run_btn = tk.Button(
-            top, text="▶  Run", font=FONT_BOLD,
-            bg="#EAF3DE", fg="#3B6D11", activebackground="#C0DD97",
-            relief=tk.FLAT, padx=12, pady=4, command=self._run)
-        self._run_btn.pack(side=tk.LEFT, padx=8)
+            top, text="▶ Run", font=FONTB,
+            bg=CLR_GRN, fg="white", activebackground="#25A244",
+            relief=tk.FLAT, padx=8, pady=2, command=self._run)
+        self._run_btn.pack(side=tk.LEFT, padx=4)
 
         self._stop_btn = tk.Button(
-            top, text="⏹  Stop & Save", font=FONT_BOLD,
-            bg="#FAECE7", fg="#993C1D", activebackground="#F5C4B3",
-            relief=tk.FLAT, padx=12, pady=4, state=tk.DISABLED,
-            command=self._stop_and_save)
+            top, text="⏹ Stop & Save", font=FONTB,
+            bg=CLR_RED, fg="white", activebackground="#CC3730",
+            relief=tk.FLAT, padx=8, pady=2,
+            state=tk.DISABLED, command=self._stop_and_save)
         self._stop_btn.pack(side=tk.LEFT, padx=4)
 
-        self._status_var = tk.StringVar(value="Idle")
-        tk.Label(top, textvariable=self._status_var, font=FONT_UI,
-                 bg=BG_PANEL, fg=CLR_MUTED).pack(side=tk.LEFT, padx=20)
+        self._status = tk.StringVar(value="Idle")
+        tk.Label(top, textvariable=self._status,
+                 font=FONT, bg=BG_PNL, fg=FG_MUT).pack(side=tk.LEFT, padx=10)
 
-        p = self.model.pins
-        tk.Label(top,
-                 text=(f"Left lick: {p['left_lick']}   Right lick: {p['right_lick']}   "
-                       f"Left load: {p['left_load']}   Right load: {p['right_load']}"),
-                 font=("Segoe UI", 8), bg=BG_PANEL, fg=CLR_MUTED
-                 ).pack(side=tk.RIGHT, padx=16)
+        # Raster plot
+        plot_frame = tk.Frame(self, bg=BG_PNL)
+        plot_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        self._raster = RasterPanel(plot_frame, self.model.exp_id)
 
-        # ── Raster plot (scrollable) ───────────────────────────────────────────
-        plot_frame = tk.Frame(self, bg=BG_MAIN)
-        plot_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(6, 0))
+        # Compact event log
+        log_outer = tk.Frame(self, bg=BG_PNL, height=108)
+        log_outer.pack(fill=tk.X, padx=2, pady=(0, 2))
+        log_outer.pack_propagate(False)
 
-        sc = tk.Canvas(plot_frame, bg=BG_MAIN, highlightthickness=0)
-        vsb = ttk.Scrollbar(plot_frame, orient=tk.VERTICAL, command=sc.yview)
-        sc.configure(yscrollcommand=vsb.set)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        sc.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Apply ttk style once globally
+        s = ttk.Style()
+        s.theme_use("default")
+        for widget, cfg in (
+                ("Treeview",
+                 dict(background=BG, foreground=FG, fieldbackground=BG,
+                      rowheight=16, font=FONTM)),
+                ("Treeview.Heading",
+                 dict(background=BG_PNL, foreground=FG_MUT, font=FONTB))):
+            s.configure(widget, **cfg)
+        s.map("Treeview", background=[("selected", BG_ALT)])
 
-        inner = tk.Frame(sc, bg=BG_MAIN)
-        sc.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind("<Configure>",
-                   lambda e: sc.configure(scrollregion=sc.bbox("all")))
+        cols = ("ts", "id", "event", "amp")
+        self._tree = ttk.Treeview(log_outer, columns=cols,
+                                   show="headings", height=5)
+        for c, w, lbl in (("ts", 72, "ms"), ("id", 36, "ID"),
+                           ("event", 95, "Event"), ("amp", 60, "Amp")):
+            self._tree.heading(c, text=lbl)
+            self._tree.column(c, width=w, anchor=tk.CENTER)
 
-        self._raster = RasterCanvas(inner)
-
-        # ── Event log table ────────────────────────────────────────────────────
-        log_frame = tk.LabelFrame(self, text="Event log",
-                                   font=FONT_BOLD, bg=BG_MAIN, fg=CLR_DARK,
-                                   relief=tk.FLAT, pady=4)
-        log_frame.pack(fill=tk.X, padx=8, pady=(4, 8))
-
-        cols = ("timestamp_ms", "event_id", "event_name", "amplitude")
-        self._tree = ttk.Treeview(log_frame, columns=cols,
-                                   show="headings", height=8)
-        self._tree.heading("timestamp_ms", text="Timestamp (ms)")
-        self._tree.heading("event_id",     text="Event ID")
-        self._tree.heading("event_name",   text="Event")
-        self._tree.heading("amplitude",    text="Amplitude")
-        for c in cols:
-            self._tree.column(c, width=160, anchor=tk.CENTER)
-
-        sb = ttk.Scrollbar(log_frame, orient=tk.VERTICAL,
+        sb = ttk.Scrollbar(log_outer, orient=tk.VERTICAL,
                             command=self._tree.yview)
         self._tree.configure(yscrollcommand=sb.set)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self._tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._tree.pack(fill=tk.BOTH, expand=True)
 
-        self._tree.tag_configure("left",  foreground=CLR_RED)
-        self._tree.tag_configure("right", foreground=CLR_BLUE)
-        self._tree.tag_configure("exp",   foreground=CLR_DARK)
-        self._tree.tag_configure("load",  foreground=CLR_MUTED)
-        self._shown = 0   # rows already appended to tree
+        self._tree.tag_configure("left",  foreground=CLR_L)
+        self._tree.tag_configure("right", foreground=CLR_R)
+        self._tree.tag_configure("exp",   foreground=CLR_EXP)
+        self._tree.tag_configure("load",  foreground=FG_MUT)
 
-    # ── Controls ───────────────────────────────────────────────────────────────
+    # ── Controls ──────────────────────────────────────────────────────────────
 
     def _run(self):
         if not self.model.running:
             self.model.start(self._arduino_ts[0])
             self._run_btn.config(state=tk.DISABLED)
             self._stop_btn.config(state=tk.NORMAL)
+            self._shown = 0
             self._schedule()
 
     def _stop_and_save(self):
@@ -600,36 +565,26 @@ class ExperimentWindow(tk.Toplevel):
             self.model.stop(self._arduino_ts[0])
         if self._refresh_job:
             self.after_cancel(self._refresh_job)
-        self._refresh()   # final flush
+        self._refresh()  # final flush
 
-        stem = (f"experiment_{self.model.exp_id}_"
-                f"{datetime.datetime.now():%Y%m%d_%H%M%S}")
-        npy_path = filedialog.asksaveasfilename(
-            title="Save event log (.npy)",
+        stem = f"exp{self.model.exp_id}_{datetime.datetime.now():%Y%m%d_%H%M%S}"
+        npy = filedialog.asksaveasfilename(
+            title=f"Save Exp {self.model.exp_id} event log",
             initialfile=stem + ".npy",
             defaultextension=".npy",
-            filetypes=[("NumPy array", "*.npy")])
-        if npy_path:
-            self.model.export_npy(npy_path)
-            png_path = os.path.splitext(npy_path)[0] + ".png"
-            self._raster.save_png(png_path)
+            filetypes=[("NumPy", "*.npy")])
+        if npy:
+            self.model.export_npy(npy)
+            png = os.path.splitext(npy)[0] + ".png"
+            self._raster.save_png(png)
             messagebox.showinfo("Saved",
-                f"Event log  →  {npy_path}\nRaster image  →  {png_path}")
+                f"Log  → {npy}\nPlot → {png}")
 
         self._run_btn.config(state=tk.NORMAL)
         self._stop_btn.config(state=tk.DISABLED)
-        self._status_var.set("Stopped")
+        self._status.set("Stopped")
 
-    def _on_close(self):
-        if self.model.running:
-            if not messagebox.askyesno(
-                    "Quit", "Experiment still running. Stop and discard data?"):
-                return
-        if self._refresh_job:
-            self.after_cancel(self._refresh_job)
-        self.destroy()
-
-    # ── Refresh ────────────────────────────────────────────────────────────────
+    # ── Refresh ───────────────────────────────────────────────────────────────
 
     def _schedule(self):
         self._refresh_job = self.after(GUI_REFRESH_MS, self._tick)
@@ -640,224 +595,308 @@ class ExperimentWindow(tk.Toplevel):
             self._schedule()
 
     def _refresh(self):
-        events = self.model.get_log_copy()
+        events = self.model.get_log()
         self._raster.update(events)
 
-        for evt in events[self._shown:]:
-            name = EVENT_NAMES.get(evt.event_id, f"evt_{evt.event_id}")
-            tag  = EVENT_TAGS.get(evt.event_id, "")
+        for e in events[self._shown:]:
+            name = _EVT_NAME.get(e.event_id, f"#{e.event_id}")
+            tag  = _EVT_TAG.get(e.event_id, "")
             self._tree.insert("", tk.END,
-                              values=(evt.timestamp_ms, evt.event_id,
-                                      name, f"{evt.amplitude:.2f}"),
+                              values=(e.timestamp_ms, e.event_id,
+                                      name, f"{e.amplitude:.1f}"),
                               tags=(tag,))
         self._shown = len(events)
         if events:
             self._tree.yview_moveto(1.0)
 
         if self.model.running and self.model.start_ts is not None:
-            elapsed_s = (self._arduino_ts[0] - self.model.start_ts) / 1000
-            self._status_var.set(f"Running  ·  {elapsed_s:.1f} s elapsed")
+            el = (self._arduino_ts[0] - self.model.start_ts) / 1000
+            self._status.set(f"● {el:.0f} s")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CALIBRATION / SETUP WINDOW  (root window)
+# MAIN WINDOW
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _card(parent) -> tk.Frame:
-    return tk.Frame(parent, bg=BG_CARD,
-                    highlightbackground="#D3D1C7", highlightthickness=1,
-                    padx=14, pady=10)
-
-def _lbl(parent, text, bold=False, muted=False) -> tk.Label:
-    return tk.Label(parent, text=text,
-                    font=FONT_BOLD if bold else FONT_UI,
-                    fg=CLR_MUTED if muted else CLR_DARK,
-                    bg=parent["bg"])
-
-def _ent(parent, var, width=10) -> tk.Entry:
-    return tk.Entry(parent, textvariable=var, width=width,
-                    font=FONT_MONO, relief=tk.FLAT,
-                    highlightbackground="#D3D1C7", highlightthickness=1)
-
-def _btn(parent, text, cmd, bg="#EAF3DE", fg="#3B6D11") -> tk.Button:
-    return tk.Button(parent, text=text, command=cmd,
-                     font=FONT_BOLD, bg=bg, fg=fg,
-                     activebackground="#C0DD97", relief=tk.FLAT,
-                     padx=10, pady=4)
-
-
-class SetupWindow(tk.Tk):
-
+class MainWindow(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Lickometer  ·  Setup & Calibration")
-        self.geometry("880x700")
-        self.configure(bg=BG_MAIN)
+        self.title("Lickometer  ·  Columbia AIC")
+        self.configure(bg=BG)
+        self.geometry("1440x920")
 
-        self._reader      = SerialReader(SERIAL_PORT)
-        self._models      = {i: ExperimentModel(i) for i in range(1, 5)}
-        self._exp_windows = {}
-        self._arduino_ts  = [0]     # mutable int, shared with all exp windows
-        self._connected   = False
-        self._last_raw    = {}      # {pin: last float value} — for snap
-
-        # Tk variables for settings
-        self._port_var      = tk.StringVar(value=SERIAL_PORT)
-        self._load_poll_var = tk.StringVar(value=str(LOAD_CELL_POLL_MS))
-        self._ts_poll_var   = tk.StringVar(value=str(TIMESTAMP_POLL_MS))
-
-        # Snap storage: {(exp_id, side, "50g"|"bottle"): float}
-        self._snaps       = {}
-        self._snap_svars  = {}   # StringVars for the snap display labels
+        self._reader     = SerialReader()
+        self._models     = {i: ExperimentModel(i) for i in range(1, 5)}
+        self._arduino_ts = [0]
+        self._connected  = False
+        self._streaming  = False
+        self._last_raw:  Dict[int, float] = {}   # {arduino_id: last_amp}
+        self._snaps:     Dict[tuple, float] = {} # {(load_id, "50g"|"bottle"): val}
 
         self._build()
 
-    # ── Build UI ───────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # LAYOUT
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _build(self):
-        # Header
-        hdr = tk.Frame(self, bg=BG_PANEL, pady=10)
-        hdr.pack(fill=tk.X)
-        tk.Label(hdr, text="Lickometer  ·  Setup & Calibration",
-                 font=("Segoe UI", 13, "bold"),
-                 bg=BG_PANEL, fg=CLR_DARK).pack(side=tk.LEFT, padx=16)
+        # Top strip
+        top_strip = tk.Frame(self, bg=BG_PNL, pady=5)
+        top_strip.pack(fill=tk.X)
+        self._build_top_strip(top_strip)
 
-        # Scrollable body
-        outer = tk.Frame(self, bg=BG_MAIN)
-        outer.pack(fill=tk.BOTH, expand=True)
-        sc = tk.Canvas(outer, bg=BG_MAIN, highlightthickness=0)
-        vsb = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=sc.yview)
+        # Notebook
+        s = ttk.Style()
+        s.configure("TNotebook",     background=BG,     borderwidth=0)
+        s.configure("TNotebook.Tab", background=BG_PNL, foreground=FG_MUT,
+                    padding=[12, 4], font=FONTB)
+        s.map("TNotebook.Tab",
+              background=[("selected", BG_ALT)],
+              foreground=[("selected", FG)])
+
+        nb = ttk.Notebook(self)
+        nb.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        exp_tab  = tk.Frame(nb, bg=BG);  nb.add(exp_tab,  text="  Experiments  ")
+        cal_tab  = tk.Frame(nb, bg=BG);  nb.add(cal_tab,  text="  Calibration  ")
+        term_tab = tk.Frame(nb, bg=BG);  nb.add(term_tab, text="  Terminal  ")
+
+        self._build_quad_tab(exp_tab)
+        self._build_cal_tab(cal_tab)
+        self._build_terminal_tab(term_tab)
+
+    # ── Top strip ─────────────────────────────────────────────────────────────
+
+    def _build_top_strip(self, parent):
+        def lbl(text):
+            return tk.Label(parent, text=text, font=FONT, bg=BG_PNL, fg=FG)
+
+        def btn(text, cmd, bg=BG_ALT, fg=FG, **kw):
+            return tk.Button(parent, text=text, command=cmd,
+                             font=FONTB, bg=bg, fg=fg,
+                             activebackground=BG, relief=tk.FLAT,
+                             padx=10, pady=3, **kw)
+
+        lbl("Port:").pack(side=tk.LEFT, padx=(12, 4))
+        self._port_var = tk.StringVar(value=SERIAL_PORT)
+        tk.Entry(parent, textvariable=self._port_var, width=14,
+                 font=FONTM, bg=BG_ALT, fg=FG,
+                 insertbackground=FG, relief=tk.FLAT
+                 ).pack(side=tk.LEFT, padx=4)
+
+        self._conn_btn = btn("Connect", self._toggle_connect)
+        self._conn_btn.pack(side=tk.LEFT, padx=6)
+
+        self._conn_lbl = tk.Label(parent, text="⚫ Disconnected",
+                                   font=FONT, bg=BG_PNL, fg=FG_MUT)
+        self._conn_lbl.pack(side=tk.LEFT, padx=10)
+
+        tk.Frame(parent, bg=FG_MUT, width=1, height=22
+                 ).pack(side=tk.LEFT, padx=12, fill=tk.Y)
+
+        lbl("Weight report interval (s):").pack(side=tk.LEFT, padx=(0, 4))
+        self._interval_var = tk.StringVar(value="30")
+        tk.Spinbox(parent, from_=10, to=99999,
+                   textvariable=self._interval_var,
+                   width=7, font=FONTM, bg=BG_ALT, fg=FG,
+                   buttonbackground=BG_ALT, relief=tk.FLAT
+                   ).pack(side=tk.LEFT, padx=4)
+        btn("Set", self._send_interval).pack(side=tk.LEFT, padx=4)
+
+        tk.Frame(parent, bg=FG_MUT, width=1, height=22
+                 ).pack(side=tk.LEFT, padx=12, fill=tk.Y)
+
+        self._stream_btn = tk.Button(
+            parent, text="▶ Start Arduino stream", font=FONTB,
+            bg=CLR_GRN, fg="white", activebackground="#25A244",
+            relief=tk.FLAT, padx=10, pady=3,
+            state=tk.DISABLED, command=self._toggle_stream)
+        self._stream_btn.pack(side=tk.LEFT, padx=6)
+
+        self._ts_lbl = tk.Label(parent, text="ts: —",
+                                 font=FONTM, bg=BG_PNL, fg=FG_MUT)
+        self._ts_lbl.pack(side=tk.RIGHT, padx=16)
+
+    # ── Tab: Experiments (4 quadrants) ────────────────────────────────────────
+
+    def _build_quad_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=1)
+        parent.rowconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+
+        positions = {1: (0, 0), 2: (0, 1), 3: (1, 0), 4: (1, 1)}
+        for exp_id, (row, col) in positions.items():
+            q = ExpQuadrant(parent, self._models[exp_id],
+                            self._reader, self._arduino_ts)
+            q.grid(row=row, column=col, sticky="nsew", padx=3, pady=3)
+
+    # ── Tab: Calibration ──────────────────────────────────────────────────────
+
+    def _build_cal_tab(self, parent):
+        sc = tk.Canvas(parent, bg=BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=sc.yview)
         sc.configure(yscrollcommand=vsb.set)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        sc.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        body = tk.Frame(sc, bg=BG_MAIN)
+        sc.pack(fill=tk.BOTH, expand=True)
+        body = tk.Frame(sc, bg=BG)
         sc.create_window((0, 0), window=body, anchor="nw")
         body.bind("<Configure>",
                   lambda e: sc.configure(scrollregion=sc.bbox("all")))
 
-        self._build_connection(body)
-        self._build_settings(body)
-        self._build_load_cal(body)
-        self._build_launch(body)
+        def section(title, subtitle=""):
+            tk.Label(body, text=title, font=FONTB, bg=BG, fg=FG
+                     ).pack(anchor="w", padx=16, pady=(16, 1))
+            if subtitle:
+                tk.Label(body, text=subtitle, font=FONT, bg=BG, fg=FG_MUT
+                         ).pack(anchor="w", padx=16, pady=(0, 4))
+            f = tk.Frame(body, bg=BG_PNL, padx=14, pady=10)
+            f.pack(fill=tk.X, padx=16, pady=(0, 4))
+            return f
 
-    # ── Section: Connection ────────────────────────────────────────────────────
+        # ── Hardware calibration ──────────────────────────────────────────────
+        hw = section("Hardware calibration",
+                     "Sends commands directly to the Arduino.")
 
-    def _build_connection(self, parent):
-        c = _card(parent)
-        c.pack(fill=tk.X, padx=16, pady=(14, 6))
+        def hw_row(r, label, btn_text, cmd_fn):
+            tk.Label(hw, text=label, font=FONT, bg=BG_PNL, fg=FG
+                     ).grid(row=r, column=0, sticky="w", pady=5, padx=(0, 16))
+            tk.Button(hw, text=btn_text, font=FONTB,
+                      bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=8,
+                      command=cmd_fn
+                      ).grid(row=r, column=1, sticky="w", padx=4)
 
-        _lbl(c, "Arduino connection", bold=True).grid(
-            row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        hw_row(0, "Offset calibration — all channels, bottles must be empty:",
+               "Send 'o'", lambda: self._reader.send("o"))
+        hw_row(1, "Gain calibration — all channels, 50g on each bottle:",
+               "Send 'cg' (all)", lambda: self._reader.send("cg"))
+        hw_row(3, "Touch sensor calibration:",
+               "Send 't'", lambda: self._reader.send("t"))
 
-        _lbl(c, "Serial port:").grid(row=1, column=0, sticky="w")
-        _ent(c, self._port_var, width=14).grid(row=1, column=1, padx=8, sticky="w")
+        tk.Label(hw, text="Gain calibration — single channel (0-7):",
+                 font=FONT, bg=BG_PNL, fg=FG
+                 ).grid(row=2, column=0, sticky="w", pady=5, padx=(0, 16))
+        self._gcal_ch = tk.StringVar(value="0")
+        tk.Spinbox(hw, from_=0, to=7, textvariable=self._gcal_ch,
+                   width=4, font=FONTM, bg=BG_ALT, fg=FG, relief=tk.FLAT
+                   ).grid(row=2, column=1, sticky="w", padx=4)
+        tk.Button(hw, text="Send 'kg'", font=FONTB,
+                  bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=8,
+                  command=lambda: self._reader.send(f"k{self._gcal_ch.get()}g")
+                  ).grid(row=2, column=2, sticky="w", padx=4)
 
-        self._conn_btn = _btn(c, "Connect", self._toggle_connect)
-        self._conn_btn.grid(row=1, column=2, padx=8)
+        # ── Touch thresholds ──────────────────────────────────────────────────
+        th = section("Touch sensitivity thresholds",
+                     "Per channel (0-7). Range 20-255, default 130. "
+                     "Persisted in Arduino EEPROM.")
+        self._thresh_vars: Dict[int, tk.StringVar] = {}
+        for ch in range(8):
+            r, c = divmod(ch, 4)
+            tk.Label(th, text=f"Ch {ch}:", font=FONT, bg=BG_PNL, fg=FG
+                     ).grid(row=r, column=c * 3, padx=(10, 2), pady=4, sticky="e")
+            v = tk.StringVar(value="130")
+            self._thresh_vars[ch] = v
+            tk.Spinbox(th, from_=20, to=255, textvariable=v, width=5,
+                       font=FONTM, bg=BG_ALT, fg=FG, relief=tk.FLAT
+                       ).grid(row=r, column=c * 3 + 1, padx=2)
+            tk.Button(th, text="Set", font=FONTB,
+                      bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=6,
+                      command=lambda ch=ch: self._set_threshold(ch)
+                      ).grid(row=r, column=c * 3 + 2, padx=4)
 
-        self._conn_status = tk.StringVar(value="⚫  Disconnected")
-        tk.Label(c, textvariable=self._conn_status, font=FONT_UI,
-                 bg=BG_CARD, fg=CLR_MUTED).grid(row=1, column=3, padx=12, sticky="w")
-
-        _lbl(c, "Live pin values:", muted=True).grid(
-            row=2, column=0, sticky="w", pady=(10, 0))
-        self._live_var = tk.StringVar(value="—")
-        tk.Label(c, textvariable=self._live_var, font=FONT_MONO,
-                 bg=BG_CARD, fg=CLR_MUTED, wraplength=580,
-                 justify=tk.LEFT).grid(row=3, column=0, columnspan=4, sticky="w")
-
-    # ── Section: Global settings ───────────────────────────────────────────────
-
-    def _build_settings(self, parent):
-        c = _card(parent)
-        c.pack(fill=tk.X, padx=16, pady=6)
-
-        _lbl(c, "Global settings", bold=True).grid(
-            row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
-
-        def row(r, label, var, unit):
-            _lbl(c, label).grid(row=r, column=0, sticky="w", pady=3)
-            _ent(c, var, width=8).grid(row=r, column=1, padx=8)
-            _lbl(c, unit, muted=True).grid(row=r, column=2, sticky="w")
-
-        row(1, "Load cell poll interval:", self._load_poll_var, "ms")
-        row(2, "Arduino timestamp poll:",  self._ts_poll_var,   "ms")
-
-        _btn(c, "Apply", self._apply_settings).grid(
-            row=3, column=0, pady=(10, 0), sticky="w")
-
-    # ── Section: Load cell calibration ────────────────────────────────────────
-
-    def _build_load_cal(self, parent):
-        c = _card(parent)
-        c.pack(fill=tk.X, padx=16, pady=6)
-
-        _lbl(c, "Load cell calibration", bold=True).pack(anchor="w", pady=(0, 6))
-        _lbl(c,
-             "Place 50g reference on bottle → Snap.  "
-             "Replace with actual bottle → Snap.  "
-             "Calibration ratio = 50g_raw ÷ bottle_raw.",
-             muted=True).pack(anchor="w", pady=(0, 10))
-
-        grid = tk.Frame(c, bg=BG_CARD)
+        # ── Software load-cell calibration ────────────────────────────────────
+        lc = section("Load cell software calibration",
+                     "1. Place 50g reference on bottle → Snap 50g.\n"
+                     "2. Remove reference, use actual bottle → Snap Bottle.\n"
+                     "Ratio = 50g_raw ÷ bottle_raw.  Applied to all load readings.")
+        grid = tk.Frame(lc, bg=BG_PNL)
         grid.pack(fill=tk.X)
 
-        for col, head in enumerate(
-                ["Exp", "Side", "Pin", "50g raw", "", "Bottle raw", "", "Ratio"]):
-            tk.Label(grid, text=head, font=FONT_BOLD, bg=BG_CARD,
-                     fg=CLR_DARK).grid(row=0, column=col, padx=6, pady=4, sticky="w")
+        for col, hd in enumerate(["Exp", "Side", "Arduino ID",
+                                   "50g raw", "", "Bottle raw", "", "Ratio"]):
+            tk.Label(grid, text=hd, font=FONTB, bg=BG_PNL, fg=FG_MUT
+                     ).grid(row=0, column=col, padx=6, pady=3, sticky="w")
 
+        self._snap_svars: Dict[tuple, tk.StringVar] = {}
         r = 1
         for exp_id in range(1, 5):
-            for side in ("left", "right"):
-                pin = EXPERIMENT_PINS[exp_id][f"{side}_load"]
+            ch = EXPERIMENT_CHANNELS[exp_id]
+            for side, load_id in (("Left",  ch["left_load"]),
+                                   ("Right", ch["right_load"])):
                 key = (exp_id, side)
+                for col, txt in ((0, str(exp_id)), (1, side),
+                                  (2, f"id {load_id}")):
+                    tk.Label(grid, text=txt, font=FONTM if col == 2 else FONT,
+                             bg=BG_PNL,
+                             fg=FG_MUT if col == 2 else FG
+                             ).grid(row=r, column=col, padx=6)
 
-                tk.Label(grid, text=str(exp_id), font=FONT_UI,
-                         bg=BG_CARD).grid(row=r, column=0, padx=6)
-                tk.Label(grid, text=side.capitalize(), font=FONT_UI,
-                         bg=BG_CARD).grid(row=r, column=1, padx=6)
-                tk.Label(grid, text=pin, font=FONT_MONO,
-                         bg=BG_CARD, fg=CLR_MUTED).grid(row=r, column=2, padx=6)
-
-                for col_offset, snap_key in enumerate(("50g", "bottle")):
+                for ci, snap_key in enumerate(("50g", "bottle")):
                     sv = tk.StringVar(value="—")
                     self._snap_svars[(exp_id, side, snap_key)] = sv
-                    tk.Label(grid, textvariable=sv, font=FONT_MONO,
-                             bg=BG_CARD, width=10).grid(
-                             row=r, column=3 + col_offset * 2, padx=4)
-                    _btn(grid, "Snap",
-                         lambda k=key, sk=snap_key: self._snap(k, sk),
-                         bg="#E6F1FB", fg="#185FA5").grid(
-                         row=r, column=4 + col_offset * 2, padx=2)
+                    tk.Label(grid, textvariable=sv, font=FONTM,
+                             bg=BG_PNL, fg=FG, width=10
+                             ).grid(row=r, column=3 + ci * 2, padx=4)
+                    lbl_txt = "Snap 50g" if ci == 0 else "Snap Bottle"
+                    tk.Button(grid, text=lbl_txt, font=FONTB,
+                              bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=6,
+                              command=lambda k=key, sk=snap_key, lid=load_id:
+                                      self._snap(k, sk, lid)
+                              ).grid(row=r, column=4 + ci * 2, padx=2)
 
-                sv_ratio = tk.StringVar(value="—")
-                self._snap_svars[(exp_id, side, "ratio")] = sv_ratio
-                tk.Label(grid, textvariable=sv_ratio, font=FONT_MONO,
-                         bg=BG_CARD, fg=CLR_GREEN).grid(row=r, column=7, padx=6)
+                sv_r = tk.StringVar(value="—")
+                self._snap_svars[(exp_id, side, "ratio")] = sv_r
+                tk.Label(grid, textvariable=sv_r, font=FONTM,
+                         bg=BG_PNL, fg=CLR_GRN
+                         ).grid(row=r, column=7, padx=8)
                 r += 1
 
-    # ── Section: Launch ────────────────────────────────────────────────────────
+    # ── Tab: Terminal ─────────────────────────────────────────────────────────
 
-    def _build_launch(self, parent):
-        c = _card(parent)
-        c.pack(fill=tk.X, padx=16, pady=(6, 18))
+    def _build_terminal_tab(self, parent):
+        tk.Label(parent,
+                 text="Raw serial terminal — all Arduino output appears here. "
+                      "You can also type commands directly.",
+                 font=FONT, bg=BG, fg=FG_MUT
+                 ).pack(anchor="w", padx=12, pady=6)
 
-        _lbl(c, "Experiments", bold=True).pack(anchor="w", pady=(0, 8))
-        _lbl(c, "Open experiment windows after calibration is complete.",
-             muted=True).pack(anchor="w", pady=(0, 10))
+        self._term_text = tk.Text(parent, bg=BG_PNL, fg=FG,
+                                   font=FONTM, relief=tk.FLAT,
+                                   state=tk.DISABLED, wrap=tk.NONE)
+        tsb_v = ttk.Scrollbar(parent, orient=tk.VERTICAL,
+                               command=self._term_text.yview)
+        tsb_h = ttk.Scrollbar(parent, orient=tk.HORIZONTAL,
+                               command=self._term_text.xview)
+        self._term_text.configure(yscrollcommand=tsb_v.set,
+                                   xscrollcommand=tsb_h.set)
+        tsb_v.pack(side=tk.RIGHT, fill=tk.Y)
+        tsb_h.pack(side=tk.BOTTOM, fill=tk.X)
+        self._term_text.pack(fill=tk.BOTH, expand=True, padx=6)
 
-        row = tk.Frame(c, bg=BG_CARD)
-        row.pack(anchor="w")
+        cmd_row = tk.Frame(parent, bg=BG, pady=4)
+        cmd_row.pack(fill=tk.X, padx=6)
+        tk.Label(cmd_row, text="Send:", font=FONT, bg=BG, fg=FG
+                 ).pack(side=tk.LEFT, padx=(0, 4))
+        self._cmd_var = tk.StringVar()
+        cmd_ent = tk.Entry(cmd_row, textvariable=self._cmd_var, width=32,
+                           font=FONTM, bg=BG_PNL, fg=FG,
+                           insertbackground=FG, relief=tk.FLAT)
+        cmd_ent.pack(side=tk.LEFT, padx=4)
+        cmd_ent.bind("<Return>", lambda _: self._send_raw_cmd())
+        tk.Button(cmd_row, text="Send", font=FONTB,
+                  bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=8,
+                  command=self._send_raw_cmd
+                  ).pack(side=tk.LEFT, padx=4)
+        tk.Button(cmd_row, text="Clear", font=FONTB,
+                  bg=BG_ALT, fg=FG_MUT, relief=tk.FLAT, padx=8,
+                  command=self._clear_terminal
+                  ).pack(side=tk.LEFT, padx=4)
 
-        _btn(row, "Open all 4 experiments",
-             self._open_all).pack(side=tk.LEFT, padx=(0, 12))
-        for exp_id in range(1, 5):
-            _btn(row, f"Exp {exp_id}",
-                 lambda i=exp_id: self._open_exp(i),
-                 bg=BG_PANEL, fg=CLR_DARK).pack(side=tk.LEFT, padx=4)
+        self.after(300, self._poll_terminal)
 
-    # ── Actions ────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # ACTIONS
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _toggle_connect(self):
         if not self._connected:
@@ -865,117 +904,133 @@ class SetupWindow(tk.Tk):
             ok = self._reader.connect()
             self._connected = True
             self._conn_btn.config(text="Disconnect")
-            if ok:
-                self._conn_status.set("🟢  Connected")
-            else:
-                self._conn_status.set("🟡  Simulation mode (no hardware)")
+            self._conn_lbl.config(
+                text="🟢 Connected" if ok else "🟡 Simulation mode",
+                fg=CLR_GRN if ok else CLR_EXP)
+            self._stream_btn.config(state=tk.NORMAL)
             self._start_dispatch()
         else:
+            if self._streaming:
+                self._toggle_stream()
             self._reader.disconnect()
-            self._connected = False
+            self._connected  = False
             self._conn_btn.config(text="Connect")
-            self._conn_status.set("⚫  Disconnected")
+            self._conn_lbl.config(text="⚫ Disconnected", fg=FG_MUT)
+            self._stream_btn.config(state=tk.DISABLED)
 
-    def _apply_settings(self):
-        global LOAD_CELL_POLL_MS, TIMESTAMP_POLL_MS
+    def _send_interval(self):
         try:
-            LOAD_CELL_POLL_MS = int(self._load_poll_var.get())
-            TIMESTAMP_POLL_MS = int(self._ts_poll_var.get())
+            n = int(self._interval_var.get())
+            if not 10 <= n <= 99999:
+                raise ValueError
         except ValueError:
-            messagebox.showerror("Invalid input", "Settings must be integers.")
+            messagebox.showerror("Bad interval", "Must be 10–99999 seconds.")
             return
-        messagebox.showinfo("Applied",
-            f"Load cell poll: {LOAD_CELL_POLL_MS} ms\n"
-            f"TS poll: {TIMESTAMP_POLL_MS} ms")
+        self._reader.send(f"i{n}")
 
-    def _snap(self, key: tuple, snap_key: str):
-        exp_id, side = key
-        pin = EXPERIMENT_PINS[exp_id][f"{side}_load"]
-        raw = self._last_raw.get(pin)
+    def _toggle_stream(self):
+        if not self._streaming:
+            self._reader.send("r")
+            self._streaming = True
+            self._stream_btn.config(text="⏹ Stop Arduino stream",
+                                     bg=CLR_RED, activebackground="#CC3730")
+        else:
+            self._reader.send("s")
+            self._streaming = False
+            self._stream_btn.config(text="▶ Start Arduino stream",
+                                     bg=CLR_GRN, activebackground="#25A244")
+
+    def _set_threshold(self, ch: int):
+        try:
+            n = int(self._thresh_vars[ch].get())
+            if not 20 <= n <= 255:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Bad threshold", "Must be 20–255.")
+            return
+        # Arduino: send "s<ch>\r\n" then value "\r\n"
+        self._reader.send(f"s{ch}")
+        self.after(200, lambda: self._reader.send(str(n)))
+
+    def _snap(self, key: tuple, snap_key: str, load_id: int):
+        raw = self._last_raw.get(load_id)
         if raw is None:
             messagebox.showwarning("No data",
-                f"No reading yet for {pin}. Is the Arduino sending data?")
+                f"No reading yet for load ID {load_id}. "
+                "Start the Arduino stream first.")
             return
-        self._snaps[(exp_id, side, snap_key)] = raw
-        self._snap_svars[(exp_id, side, snap_key)].set(f"{raw:.2f}")
+        self._snaps[(load_id, snap_key)] = raw
+        exp_id, side = key
+        self._snap_svars[(exp_id, side, snap_key)].set(f"{raw:.1f}")
 
-        v50  = self._snaps.get((exp_id, side, "50g"))
-        vbot = self._snaps.get((exp_id, side, "bottle"))
+        v50  = self._snaps.get((load_id, "50g"))
+        vbot = self._snaps.get((load_id, "bottle"))
         if v50 is not None and vbot is not None and vbot != 0:
             ratio = v50 / vbot
             self._snap_svars[(exp_id, side, "ratio")].set(f"{ratio:.5f}")
-            model = self._models[exp_id]
-            if side == "left":
-                model.cal_left_load  = ratio
+            m = self._models[exp_id]
+            if side == "Left":
+                m.cal_left  = ratio
             else:
-                model.cal_right_load = ratio
+                m.cal_right = ratio
 
-    def _open_all(self):
-        for i in range(1, 5):
-            self._open_exp(i)
+    def _send_raw_cmd(self):
+        cmd = self._cmd_var.get().strip()
+        if cmd:
+            self._reader.send(cmd)
+            self._cmd_var.set("")
 
-    def _open_exp(self, exp_id: int):
-        if not self._connected:
-            messagebox.showwarning("Not connected",
-                "Connect to the Arduino first.")
-            return
-        w = self._exp_windows.get(exp_id)
-        if w and w.winfo_exists():
-            w.lift()
-            return
-        win = ExperimentWindow(self, self._models[exp_id], self._arduino_ts)
-        self._exp_windows[exp_id] = win
+    def _clear_terminal(self):
+        self._term_text.config(state=tk.NORMAL)
+        self._term_text.delete("1.0", tk.END)
+        self._term_text.config(state=tk.DISABLED)
 
-    # ── Background dispatch ────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # BACKGROUND DISPATCH
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _start_dispatch(self):
-        self._last_raw = {}
         threading.Thread(target=self._dispatch_loop, daemon=True).start()
-        self.after(200, self._poll_live_label)
+        self.after(500, self._poll_ts_label)
 
     def _dispatch_loop(self):
-        """Background thread: reads queue, routes sensor messages to models."""
-        # Build lookup: pin -> (model, "touch"|"load")
-        pin_map = {}
-        for exp_id, model in self._models.items():
-            p = model.pins
-            pin_map[p["left_lick"]]  = (model, "touch")
-            pin_map[p["right_lick"]] = (model, "touch")
-            pin_map[p["left_load"]]  = (model, "load")
-            pin_map[p["right_load"]] = (model, "load")
-
         while self._connected:
             try:
                 msg = self._reader.queue.get(timeout=0.2)
-            except Exception:
+            except queue.Empty:
                 continue
+            ts  = msg["ts"]
+            aid = msg["id"]
+            amp = msg["amp"]
+            self._arduino_ts[0] = ts
+            self._last_raw[aid] = amp
+            for model in self._models.values():
+                if model.owns(aid):
+                    model.ingest(ts, aid, amp)
 
-            if msg["type"] == "ts":
-                self._arduino_ts[0] = msg["ts"]
+    def _poll_ts_label(self):
+        self._ts_lbl.config(text=f"ts: {self._arduino_ts[0]}")
+        self.after(500, self._poll_ts_label)
 
-            elif msg["type"] == "sensor":
-                pin, value, ts = msg["pin"], msg["value"], msg["ts"]
-                self._last_raw[pin] = value
-                self._arduino_ts[0] = ts
-                if pin in pin_map:
-                    model, kind = pin_map[pin]
-                    if kind == "touch":
-                        model.process_touch(pin, value, ts)
-                    else:
-                        model.process_load_cell(pin, value, ts)
-
-    def _poll_live_label(self):
-        if self._last_raw:
-            items = [f"{p}={'1' if v == 1.0 else ('0' if v == 0.0 else f'{v:.0f}')}"
-                     for p, v in list(self._last_raw.items())[:10]]
-            self._live_var.set("  |  ".join(items))
-        self.after(500, self._poll_live_label)
+    def _poll_terminal(self):
+        lines = []
+        try:
+            while True:
+                lines.append(self._reader.raw_queue.get_nowait())
+        except queue.Empty:
+            pass
+        if lines:
+            self._term_text.config(state=tk.NORMAL)
+            self._term_text.insert(tk.END, "\n".join(lines) + "\n")
+            self._term_text.see(tk.END)
+            # cap terminal at ~2000 lines
+            n = int(self._term_text.index("end-1c").split(".")[0])
+            if n > 2000:
+                self._term_text.delete("1.0", f"{n - 1500}.0")
+            self._term_text.config(state=tk.DISABLED)
+        self.after(200, self._poll_terminal)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
-    app = SetupWindow()
-    app.mainloop()
+    MainWindow().mainloop()
