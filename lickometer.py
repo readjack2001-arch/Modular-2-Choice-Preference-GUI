@@ -99,7 +99,8 @@ LOAD_NOLICK_MINUTES     = 30    # 2c: sample window — load changed but no lick
 LOAD_CHANGE_TOLERANCE_G = 0.5   # 2c: load swing (g) below this counts as "no change"
 
 # ── Raster plot visuals (Task 5) — first-run defaults, editable in GUI ──
-LOAD_YMIN   = 0.0     # bottom of the load-cell scale (g)
+LOAD_YMIN   = 30.0    # bottom of the load-cell scale (g) — zoom to the working
+                      #   bottle-weight range; readings below this clip to baseline
 LOAD_YMAX   = 60.0    # top of the load-cell scale (g)
 LOAD_YTICKS = 4       # number of tick marks on the load-cell scale
 
@@ -150,9 +151,15 @@ BG_PNL  = "#2C2C2E"
 BG_ALT  = "#3A3A3C"
 FG      = "#F2F2F7"
 FG_MUT  = "#8E8E93"
-CLR_L   = "#FF6B6B"   # left lick / left load
-CLR_R   = "#4DA6FF"   # right lick / right load
-CLR_EXP = "#FFD60A"   # onset/offset markers
+# ── Data-series colours: Paul Tol "muted" qualitative scheme (colour-blind
+#    safe — distinguishable under deuteranopia/protanopia/tritanopia). ──
+CLR_L      = "#CC6677"   # left  lick / left  load   (Tol rose)
+CLR_R      = "#88CCEE"   # right lick / right load   (Tol cyan)
+CLR_EXP    = "#DDCC77"   # onset / offset markers     (Tol sand)
+CLR_LOAD_L = "#44AA99"   # full-view L load line      (Tol teal)
+CLR_LOAD_R = "#AA4499"   # full-view R load line      (Tol purple)
+# ── UI status colours (left as conventional go/stop affordances; the Start/
+#    Stop buttons also carry text labels, so they aren't colour-coded alone). ──
 CLR_GRN = "#30D158"
 CLR_RED = "#FF453A"
 
@@ -1056,7 +1063,13 @@ class RasterPanel:
             facecolor=BG_PNL, edgecolor=BG_ALT, labelcolor=FG, ncol=5)
 
     def _draw_load_ticks(self, ax, n_disp: int, bpr: int):
-        """Dotted reference lines + gram labels for the load scale (Task 5)."""
+        """Dotted reference lines + gram labels for the load scale (Task 5).
+
+        Faint reference lines are drawn at every tick level in every visible
+        row; the right edge of each row is then labelled with the load-cell
+        scale MIN (at the baseline) and MAX (at the trace peak) in grams, so
+        the area-plot amplitude can be read directly off the right axis.
+        """
         span = self.load_ymax - self.load_ymin
         if span <= 0:
             return
@@ -1068,11 +1081,14 @@ class RasterPanel:
                 y = d + frac * 0.65
                 ax.plot([0, bpr], [y, y], color=FG_MUT, alpha=0.10,
                         linewidth=0.5, linestyle=(0, (2, 3)), zorder=1)
-        for tg in ticks:
-            frac = (tg - self.load_ymin) / span
-            ax.text(bpr * 1.01, frac * 0.65, f"{tg:g}",
+        # Right-axis scale labels: min at each row's baseline, max at its peak.
+        for d in range(n_disp):
+            ax.text(bpr * 1.01, d + 0.0,  f"{self.load_ymin:g}",
                     fontsize=5, color=FG_MUT, va="center", ha="left")
-        ax.text(bpr * 1.01, 0.70, "g", fontsize=5, color=FG_MUT,
+            ax.text(bpr * 1.01, d + 0.65, f"{self.load_ymax:g}",
+                    fontsize=5, color=FG_MUT, va="center", ha="left")
+        # Unit marker, once, just below the first row's max label.
+        ax.text(bpr * 1.01, 0.80, "g", fontsize=5, color=FG_MUT,
                 va="center", ha="left")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1156,7 +1172,7 @@ class ExpQuadrant(tk.Frame):
         cols = ("ts", "id", "event", "amp")
         self._tree = ttk.Treeview(log_outer, columns=cols,
                                    show="headings", height=5)
-        for c, w, lbl in (("ts", 72, "ms"), ("id", 36, "ID"),
+        for c, w, lbl in (("ts", 72, "min"), ("id", 36, "ID"),
                            ("event", 95, "Event"), ("amp", 60, "Amp")):
             self._tree.heading(c, text=lbl)
             self._tree.column(c, width=w, anchor=tk.CENTER)
@@ -1258,7 +1274,8 @@ class ExpQuadrant(tk.Frame):
             tag  = _EVT_TAG.get(e.event_id, "")
             iid = self._tree.insert(
                 "", tk.END,
-                values=(e.timestamp_ms, e.event_id, name, f"{e.amplitude:.1f}"),
+                values=(f"{e.timestamp_ms / 60000:.3f}", e.event_id, name,
+                        f"{e.amplitude:.1f}"),
                 tags=(tag,))
             self._tree_items.append((e.timestamp_ms, iid))
         self._shown = len(events)
@@ -1297,15 +1314,16 @@ class ExpQuadrant(tk.Frame):
 # overlaid — there are NOT two separate sub-plots.
 
 class FullViewPanel(tk.Frame):
-    """Whole-experiment raster: superimposed L/R lick heat-maps (left = red,
-    right = blue, colour intensity = lick count, each with its own count
-    colour-bar) plus offset load-cell line plots (left = green, right = black)."""
+    """Whole-experiment raster: superimposed L/R lick heat-maps (left = rose,
+    right = cyan, colour intensity = lick count, each with its own count
+    colour-bar) plus offset load-cell line plots (left = teal, right = purple)."""
 
     # Sequential colormaps: faint (least-dense bin) → saturated (densest bin).
+    # Tol-muted hues so L/R stay distinguishable for colour-blind viewers.
     _CMAP_L = mcolors.LinearSegmentedColormap.from_list(
-        "Lred",  ["#F4B6B6", "#FF0000"])     # very-less red → all-the-way red
+        "Lrose", ["#F2DCE0", "#CC6677"])     # pale rose → Tol rose (left)
     _CMAP_R = mcolors.LinearSegmentedColormap.from_list(
-        "Rblue", ["#B6C8F4", "#0000FF"])     # very-less blue → all-the-way blue
+        "Rcyan", ["#DCEEF7", "#88CCEE"])     # pale cyan → Tol cyan (right)
 
     def __init__(self, parent, exp_id: int, *,
                  rows: int = FULL_ROWS,
@@ -1429,12 +1447,12 @@ class FullViewPanel(tk.Frame):
         self._draw_count_bar(self._cax_l, self._CMAP_L, maxL, "L licks/bin")
         self._draw_count_bar(self._cax_r, self._CMAP_R, maxR, "R licks/bin")
 
-        # ── Load-cell line plots: left = green, right = black, slightly offset
-        #    vertically from each other; thick line, no shaded fill ────────────
+        # ── Load-cell line plots: left = teal, right = purple (Tol muted),
+        #    slightly offset vertically from each other; thick line, no fill ───
         span = self.load_ymax - self.load_ymin
         if span > 0:
-            for load_eid, color, dy in ((_L_LOAD, CLR_GRN, +0.06),
-                                        (_R_LOAD, "#000000", -0.06)):
+            for load_eid, color, dy in ((_L_LOAD, CLR_LOAD_L, +0.06),
+                                        (_R_LOAD, CLR_LOAD_R, -0.06)):
                 by_row: Dict[int, List[Tuple[float, float]]] = {}
                 for e in events:
                     if e.event_id != load_eid:
@@ -1516,14 +1534,14 @@ class FullViewPanel(tk.Frame):
                            fontsize=7, color=FG_MUT)
         ax.set_ylabel("row start", fontsize=8, color=FG_MUT)
 
-        ax.set_title(f"Exp {self.exp_id} — licks (L red / R blue, intensity = "
+        ax.set_title(f"Exp {self.exp_id} — licks (L rose / R cyan, intensity = "
                      f"count) + load", fontsize=10, color=FG, loc="left", pad=4)
         ax.legend(
             handles=[
-                mpatches.Patch(color="#FF0000", label="L lick"),
-                mpatches.Patch(color="#0000FF", label="R lick"),
-                Line2D([0], [0], color=CLR_GRN,   linewidth=2.4, label="L load"),
-                Line2D([0], [0], color="#000000", linewidth=2.4, label="R load"),
+                mpatches.Patch(color=CLR_L, label="L lick"),
+                mpatches.Patch(color=CLR_R, label="R lick"),
+                Line2D([0], [0], color=CLR_LOAD_L, linewidth=2.4, label="L load"),
+                Line2D([0], [0], color=CLR_LOAD_R, linewidth=2.4, label="R load"),
             ],
             loc="upper right", fontsize=6, framealpha=0.30,
             facecolor=BG_PNL, edgecolor=BG_ALT, labelcolor=FG, ncol=4)
