@@ -211,6 +211,7 @@ DEFAULT_SETTINGS = {
             "load_nochange_minutes":   LOAD_NOCHANGE_MINUTES,
             "load_nolick_minutes":     LOAD_NOLICK_MINUTES,
             "load_change_tolerance_g": LOAD_CHANGE_TOLERANCE_G,
+            "postbout_delay_seconds":  10,
         },
         "plot": {
             "load_ymin":   LOAD_YMIN,
@@ -219,6 +220,8 @@ DEFAULT_SETTINGS = {
             # Load-cell display (Task V1 / LC27)
             "load_show":      1,     # 1/0: capture + plot load cell data at all
             "load_linewidth": 1.2,   # full-view (Box tab) load line width
+            "load_auto":      1,     # 1/0: auto-scale load axis from collected data
+            "load_avg_n":     5,     # plot-rate averaging: samples per plotted point
             # Monitor (live 4-row quadrant) raster timing
             "monitor_timebin_ms":      TIMEBIN_MS,
             "monitor_seconds_per_row": SECONDS_PER_ROW,
@@ -576,18 +579,21 @@ _EXP_ONSET  = 0;  _EXP_OFFSET  = 1
 _L_ON       = 2;  _L_OFF       = 3
 _R_ON       = 4;  _R_OFF       = 5
 _L_LOAD     = 6;  _R_LOAD      = 7
+_L_POSTW    = 8;  _R_POSTW     = 9    # C6: weight measured ~N s after a lick bout ends
 
 _EVT_NAME = {
     _EXP_ONSET: "Exp onset",   _EXP_OFFSET: "Exp offset",
     _L_ON:      "L lick ON",   _L_OFF:      "L lick OFF",
     _R_ON:      "R lick ON",   _R_OFF:      "R lick OFF",
     _L_LOAD:    "L load",      _R_LOAD:     "R load",
+    _L_POSTW:   "L post-bout weight", _R_POSTW: "R post-bout weight",
 }
 _EVT_TAG = {
     _EXP_ONSET: "exp",  _EXP_OFFSET: "exp",
     _L_ON:      "left", _L_OFF:      "left",
     _R_ON:      "right",_R_OFF:      "right",
     _L_LOAD:    "load", _R_LOAD:     "load",
+    _L_POSTW:   "load", _R_POSTW:    "load",
 }
 
 
@@ -650,6 +656,11 @@ class ExperimentModel:
         self._drift_committed = {"L": 0.0, "R": 0.0}   # accumulated drift removed (g)
         self._drift_win       = {"L": None, "R": None} # current no-lick regression sums
         self._last_lick_ts:   Optional[int] = None
+
+        # ── C6: post-bout weight (sample ~N s after the last lick of a bout) ──
+        self.postbout_delay_s: float = 10.0
+        self._last_lick_side  = {"L": None, "R": None}  # ts of last lick per side
+        self._postw_pending   = {"L": False, "R": False}
 
         # Threshold above initial weight that counts as a "drink detected" flag (g)
         self.DRINK_DELTA_G: float = 0.5
@@ -797,6 +808,20 @@ class ExperimentModel:
             c += w["slope"] * w["elapsed_last"]
         return c
 
+    def _maybe_post_bout(self, side: str, el: int, ts: int,
+                         weight: float, cons: float):
+        """C6: once `postbout_delay_s` has elapsed since the last lick on a side
+        (the bout has ended and settled), log one post-bout weight event."""
+        if not self._postw_pending.get(side):
+            return
+        last = self._last_lick_side.get(side)
+        if last is None:
+            return
+        if (ts - last) >= self.postbout_delay_s * 1000.0:
+            eid = _L_POSTW if side == "L" else _R_POSTW
+            self.add(el, eid, weight, consumption=cons)
+            self._postw_pending[side] = False
+
     def ingest(self, ts: int, aid: int, amp: float):
         """
         Route one Arduino event into the log and run load-cell flag checks.
@@ -819,10 +844,14 @@ class ExperimentModel:
 
         # ── Touch events ─────────────────────────────────────────────────────
         if   aid == self.l_on_id:
-            self._drift_on_lick(ts); self.add(el, _L_ON,  1.0); return flags
+            self._drift_on_lick(ts)
+            self._last_lick_side["L"] = ts; self._postw_pending["L"] = True
+            self.add(el, _L_ON,  1.0); return flags
         elif aid == self.l_off_id: self.add(el, _L_OFF, 1.0); return flags
         elif aid == self.r_on_id:
-            self._drift_on_lick(ts); self.add(el, _R_ON,  1.0); return flags
+            self._drift_on_lick(ts)
+            self._last_lick_side["R"] = ts; self._postw_pending["R"] = True
+            self.add(el, _R_ON,  1.0); return flags
         elif aid == self.r_off_id: self.add(el, _R_OFF, 1.0); return flags
 
         # ── Load cell events ──────────────────────────────────────────────────
@@ -839,6 +868,7 @@ class ExperimentModel:
             # Consumption = baseline (initial full reading) − current weight.
             cons = self.initial_load_left - cal_val
             self.add(el, _L_LOAD, cal_val, consumption=cons)
+            self._maybe_post_bout("L", el, ts, cal_val, cons)   # C6
 
             # Flag 1: drink detected — weight rose more than DRINK_DELTA_G above initial
             if self.initial_load_left is not None:
@@ -880,6 +910,7 @@ class ExperimentModel:
             # Consumption = baseline (initial full reading) − current weight.
             cons = self.initial_load_right - cal_val
             self.add(el, _R_LOAD, cal_val, consumption=cons)
+            self._maybe_post_bout("R", el, ts, cal_val, cons)   # C6
 
             # Flag 1: drink detected — weight rose more than DRINK_DELTA_G above initial
             if self.initial_load_right is not None:
@@ -929,6 +960,8 @@ class ExperimentModel:
         self._below_flag_left   = False
         self._below_flag_right  = False
         self._drift_reset()                  # C5: clear drift estimate for new run
+        self._last_lick_side = {"L": None, "R": None}   # C6 reset
+        self._postw_pending  = {"L": False, "R": False}
         self.add(0, _EXP_ONSET)
 
     def stop(self, ts: int):
@@ -1039,7 +1072,7 @@ class ExperimentModel:
                         flags.append(
                             (f"changes in load cell value despite no licks in "
                              f"past {cfg['load_nolick_minutes']:g} minutes "
-                             f"({side})", "flag"))
+                             f"(Δ{rng:.2f} g, {side})", "flag"))
 
             return flags
         except Exception as e:
@@ -1100,6 +1133,39 @@ def _value_at(samples, t):
     return samples[i][1]
 
 
+def _avg_every_n(pairs, n):
+    """Average consecutive (ts, value) pairs in groups of n (plot-rate reduction)."""
+    n = max(1, int(n))
+    if n == 1 or len(pairs) <= 1:
+        return list(pairs)
+    out = []
+    for i in range(0, len(pairs), n):
+        chunk = pairs[i:i + n]
+        ts = sum(t for t, _ in chunk) / len(chunk)
+        v  = sum(v for _, v in chunk) / len(chunk)
+        out.append((ts, v))
+    return out
+
+
+def _prep_load(events, eids, avg_n, auto, ymin, ymax):
+    """Plot-rate-average the load samples per side and pick the effective axis:
+    auto-scaled from the collected data when `auto`, else the manual ymin/ymax."""
+    by, allv = {}, []
+    for eid in eids:
+        pairs = sorted((e.timestamp_ms, float(e.amplitude))
+                       for e in events if e.event_id == eid)
+        pairs = _avg_every_n(pairs, avg_n)
+        by[eid] = pairs
+        allv += [v for _, v in pairs]
+    if auto and allv:
+        lo, hi = min(allv), max(allv)
+        pad = max(0.5, (hi - lo) * 0.05)
+        ymin, ymax = lo - pad, hi + pad
+        if ymax - ymin <= 0:
+            ymax = ymin + 1.0
+    return by, ymin, ymax
+
+
 def _row_step_polyline(samples, row_lo_ms, row_hi_ms, tb, bpr, t_end_ms=None):
     """Step polyline for one raster row, spanning the FULL row width (Task LC24).
 
@@ -1156,6 +1222,10 @@ class RasterPanel:
         self.load_yticks = LOAD_YTICKS
         self.load_show   = True     # Task V1
         self.load_lw     = 0.9      # monitor load line width
+        self.load_auto   = True     # auto-scale load axis from data
+        self.load_avg_n  = 1        # plot-rate averaging (samples per plotted point)
+        self._eff_lo     = LOAD_YMIN   # effective axis (auto or manual), set per draw
+        self._eff_hi     = LOAD_YMAX
 
         # Titles / labels / fonts (Task L11-L13, L9, L10, LG21) — overwritten
         # from the visuals tab via apply_style(); defaults set here so the panel
@@ -1201,7 +1271,9 @@ class RasterPanel:
 
     def set_load_axis(self, ymin: float, ymax: float, yticks: int,
                       show: Optional[bool] = None,
-                      linewidth: Optional[float] = None):
+                      linewidth: Optional[float] = None,
+                      auto: Optional[bool] = None,
+                      avg_n: Optional[int] = None):
         """Update the fixed load-cell gram limits (from the visuals tab)."""
         self.load_ymin   = ymin
         self.load_ymax   = ymax
@@ -1210,6 +1282,10 @@ class RasterPanel:
             self.load_show = bool(show)
         if linewidth is not None:
             self.load_lw = max(0.1, float(linewidth))
+        if auto is not None:
+            self.load_auto = bool(auto)
+        if avg_n is not None:
+            self.load_avg_n = max(1, int(avg_n))
 
     def set_time_params(self, timebin_ms: int, seconds_per_row: int,
                         visible_rows: Optional[int] = None):
@@ -1251,6 +1327,12 @@ class RasterPanel:
         for d in range(n_disp):
             if (first_row + d) % 2 == 1:
                 ax.axhspan(d, d + 1, color=BG_ALT, zorder=0, linewidth=0)
+
+        # Effective load axis (auto from data or manual) + plot-rate-averaged
+        # samples, computed once so ticks and traces agree.
+        self._load_by, self._eff_lo, self._eff_hi = _prep_load(
+            events, (_L_LOAD, _R_LOAD), self.load_avg_n, self.load_auto,
+            self.load_ymin, self.load_ymax)
 
         if self.load_show:
             self._draw_load_ticks(ax, n_disp, bpr)
@@ -1302,17 +1384,15 @@ class RasterPanel:
         # V1: only when enabled. LC24: continuous zero-order-hold across the full
         # row width (no gaps). LC25: HIGH value at the TOP of the row band, low at
         # the bottom. LC26: shading stays within the row band (line → row bottom).
-        span = self.load_ymax - self.load_ymin
+        span = self._eff_hi - self._eff_lo
         if self.load_show and span > 0:
             t_end = max((e.timestamp_ms for e in events), default=0)
             band_top = 0.08          # fraction below the row's top edge
             band_bot = 0.92          # fraction above the row's bottom edge
             band_h   = band_bot - band_top
             for load_eid, color in ((_L_LOAD, CLR_L), (_R_LOAD, CLR_R)):
-                samples = sorted(
-                    (e.timestamp_ms,
-                     float(np.clip((e.amplitude - self.load_ymin) / span, 0.0, 1.0)))
-                    for e in events if e.event_id == load_eid)
+                samples = [(t, float(np.clip((v - self._eff_lo) / span, 0.0, 1.0)))
+                           for (t, v) in self._load_by.get(load_eid, [])]
                 if not samples:
                     continue
                 # Carry the first reading back to t=0 so the trace reaches the
@@ -1396,25 +1476,27 @@ class RasterPanel:
         scale MIN (at the baseline) and MAX (at the trace peak) in grams, so
         the area-plot amplitude can be read directly off the right axis.
         """
-        span = self.load_ymax - self.load_ymin
+        span = self._eff_hi - self._eff_lo
         if span <= 0:
             return
         band_top, band_bot = 0.08, 0.92
         band_h = band_bot - band_top
-        ticks = np.linspace(self.load_ymin, self.load_ymax,
+        ticks = np.linspace(self._eff_lo, self._eff_hi,
                             max(2, int(self.load_yticks)))
         for d in range(n_disp):
             for tg in ticks:
-                frac = (tg - self.load_ymin) / span
+                frac = (tg - self._eff_lo) / span
                 y = (d + band_bot) - frac * band_h        # high value → top
                 ax.plot([0, bpr], [y, y], color=FG_MUT, alpha=0.10,
                         linewidth=0.5, linestyle=(0, (2, 3)), zorder=1)
-        # Right-edge scale labels: MAX at the row top, MIN at the row bottom.
+        # Right-edge scale labels at EVERY tick level (was only min/max), so the
+        # load-cell scale can be read off the right axis at each tick mark.
         for d in range(n_disp):
-            ax.text(bpr * 1.01, d + band_bot, f"{self.load_ymin:g}",
-                    fontsize=5, color=FG_MUT, va="center", ha="left")
-            ax.text(bpr * 1.01, d + band_top, f"{self.load_ymax:g}",
-                    fontsize=5, color=FG_MUT, va="center", ha="left")
+            for tg in ticks:
+                frac = (tg - self._eff_lo) / span
+                y = (d + band_bot) - frac * band_h
+                ax.text(bpr * 1.01, y, f"{tg:g}",
+                        fontsize=5, color=FG_MUT, va="center", ha="left")
         # Unit marker, once, just above the first row's max label.
         ax.text(bpr * 1.01, 0.0, "g", fontsize=5, color=FG_MUT,
                 va="center", ha="left")
@@ -1481,7 +1563,9 @@ class ExpQuadrant(tk.Frame):
         self._raster.apply_style(pv)
         self._raster.set_load_axis(pv["load_ymin"], pv["load_ymax"],
                                    pv["load_yticks"],
-                                   show=bool(pv.get("load_show", 1)))
+                                   show=bool(pv.get("load_show", 1)),
+                                   auto=bool(pv.get("load_auto", 1)),
+                                   avg_n=int(pv.get("load_avg_n", 5)))
 
         # Rolling event log (last X minutes only).
         log_outer = tk.Frame(self, bg=BG_PNL, height=108)
@@ -1537,7 +1621,9 @@ class ExpQuadrant(tk.Frame):
         self._raster.apply_style(pv)
         self._raster.set_load_axis(pv["load_ymin"], pv["load_ymax"],
                                    pv["load_yticks"],
-                                   show=bool(pv.get("load_show", 1)))
+                                   show=bool(pv.get("load_show", 1)),
+                                   auto=bool(pv.get("load_auto", 1)),
+                                   avg_n=int(pv.get("load_avg_n", 5)))
         self._raster.set_time_params(mp["monitor_timebin_ms"],
                                      mp["monitor_seconds_per_row"])
         self._raster.update(self.model.get_log())
@@ -1712,6 +1798,11 @@ class FullViewPanel(tk.Frame):
         # load line plots use the same scale as the monitor quadrants).
         self.load_ymin = LOAD_YMIN
         self.load_ymax = LOAD_YMAX
+        self.load_yticks = LOAD_YTICKS
+        self.load_auto = True
+        self.load_avg_n = 1
+        self._eff_lo = LOAD_YMIN
+        self._eff_hi = LOAD_YMAX
         self.load_show = True       # Task V1
         self.load_lw   = 1.2        # Task LC27: half the old 2.4 default
 
@@ -1790,11 +1881,20 @@ class FullViewPanel(tk.Frame):
         self._cmap_r = self._make_heat_cmap(pal["R"], light, dark)
 
     def set_load_axis(self, ymin: float, ymax: float,
+                      yticks: Optional[int] = None,
                       show: Optional[bool] = None,
-                      linewidth: Optional[float] = None):
+                      linewidth: Optional[float] = None,
+                      auto: Optional[bool] = None,
+                      avg_n: Optional[int] = None):
         """Set the gram limits used to normalise the load-cell line plots."""
         self.load_ymin = ymin
         self.load_ymax = ymax
+        if yticks is not None:
+            self.load_yticks = max(2, int(yticks))
+        if auto is not None:
+            self.load_auto = bool(auto)
+        if avg_n is not None:
+            self.load_avg_n = max(1, int(avg_n))
         if show is not None:
             self.load_show = bool(show)
         if linewidth is not None:
@@ -1895,17 +1995,20 @@ class FullViewPanel(tk.Frame):
         # ── Load-cell line plots (Task V1/LC24/LC25/LC27/LC28) ──────────────────
         # V1: only when enabled. LC24: zero-order-hold across the full row width.
         # LC25: HIGH value at the row TOP. LC27: editable (default-halved) width.
-        span = self.load_ymax - self.load_ymin
+        # Effective load axis (auto from data or manual) + plot-rate-averaged
+        # samples, shared by the traces and the right-edge tick labels.
+        self._load_by, self._eff_lo, self._eff_hi = _prep_load(
+            events, (_L_LOAD, _R_LOAD), self.load_avg_n, self.load_auto,
+            self.load_ymin, self.load_ymax)
+        span = self._eff_hi - self._eff_lo
         if self.load_show and span > 0:
             t_end = max((e.timestamp_ms for e in events), default=0)
             band_top, band_bot = 0.12, 0.88
             band_h = band_bot - band_top
             tb_ms  = bin_s * 1000                  # ms per column
             for load_eid, color in ((_L_LOAD, CLR_LOAD_L), (_R_LOAD, CLR_LOAD_R)):
-                samples = sorted(
-                    (e.timestamp_ms,
-                     float(min(max((e.amplitude - self.load_ymin) / span, 0.0), 1.0)))
-                    for e in events if e.event_id == load_eid)
+                samples = [(t, float(min(max((v - self._eff_lo) / span, 0.0), 1.0)))
+                           for (t, v) in self._load_by.get(load_eid, [])]
                 if not samples:
                     continue
                 if samples[0][0] > 0:              # carry first reading back to 0
@@ -1923,14 +2026,17 @@ class FullViewPanel(tk.Frame):
                     ax.plot(xs, line_y, color=color, alpha=0.9,
                             linewidth=self.load_lw, zorder=4)
 
-            # LC28: right-edge load-cell gram labels (max at row top, min at bottom).
-            for r in range(R):
-                ax.text(C * 1.005, r + band_top, f"{self.load_ymax:g}",
-                        fontsize=6, color=FG_MUT, va="center", ha="left",
-                        zorder=6)
-                ax.text(C * 1.005, r + band_bot, f"{self.load_ymin:g}",
-                        fontsize=6, color=FG_MUT, va="center", ha="left",
-                        zorder=6)
+            # Right-edge load-cell gram labels at EVERY tick level.
+            lspan = self._eff_hi - self._eff_lo
+            if lspan > 0:
+                ticks = np.linspace(self._eff_lo, self._eff_hi,
+                                    max(2, int(self.load_yticks)))
+                for r in range(R):
+                    for tg in ticks:
+                        frac = (tg - self._eff_lo) / lspan
+                        y = (r + band_bot) - frac * band_h
+                        ax.text(C * 1.005, y, f"{tg:g}", fontsize=6,
+                                color=FG_MUT, va="center", ha="left", zorder=6)
             ax.text(C * 1.005, -0.15, "g", fontsize=6, color=FG_MUT,
                     va="center", ha="left", zorder=6)
 
@@ -1995,10 +2101,11 @@ class FullViewPanel(tk.Frame):
         ax.set_xlabel(self.xlabel_txt, fontsize=self.axislabel_size,
                       color=FG_MUT, fontfamily=self.title_font)
 
-        # Y ticks: one per row (capped), labelled by the row's start time.
-        # LC28: one extra tick beyond the usual cap.
-        n_yt = min(R, 13)
-        yt = sorted(set(np.linspace(0, R - 1, n_yt).round().astype(int).tolist()))
+        # Y ticks: evenly spaced rows so the time labels step by a CONSTANT
+        # amount (e.g. every 2 h) instead of the uneven jumps a rounded
+        # linspace produced (the old 12:00→13:00 glitch).
+        step = max(1, (R + 11) // 12)            # ≤ ~12 ticks, constant spacing
+        yt = list(range(0, R, step))
         ax.set_yticks([v + 0.5 for v in yt])
         ax.set_yticklabels([_fmt_hms(v * self.seconds_per_row) for v in yt],
                            fontsize=self.tick_size, color=FG_MUT,
@@ -2128,6 +2235,10 @@ class MainWindow(tk.Tk):
         self._reader.port = port
         self._models     = {i: ExperimentModel(i)
                             for i in range(1, self.num_boxes + 1)}
+        # C6: apply persisted post-bout weight delay to all models.
+        _pbd = float(self._settings["shared"]["flags"].get("postbout_delay_seconds", 10))
+        for _m in self._models.values():
+            _m.postbout_delay_s = _pbd
         self._arduino_ts = [0]
         self._connected  = False
         self._streaming  = False
@@ -2377,6 +2488,10 @@ class MainWindow(tk.Tk):
             out["load_yticks"] = int(out["load_yticks"])
             if "load_show" in out:
                 out["load_show"] = int(round(out["load_show"]))
+            if "load_auto" in out:
+                out["load_auto"] = int(round(out["load_auto"]))
+            if "load_avg_n" in out:
+                out["load_avg_n"] = max(1, int(round(out["load_avg_n"])))
             return out
         return dict(self._settings["shared"]["plot"])
 
@@ -2689,17 +2804,23 @@ class MainWindow(tk.Tk):
         # ── Calibration controls (snap = tell the Arduino to calibrate) ───────
         ctl = section(
             "Load-cell calibration",
-            "Three stages, each requires a STABLE reading first:\n"
-            "  1. Empty cells (nothing on them) → Snap baseline  (reference only)\n"
-            "  2. Empty bottles on the cells     → Snap Bottle  (Arduino OFFSET cal)\n"
-            "  3. 50 g weights on the cells      → Snap 50 g    (Arduino GAIN cal)\n"
-            "Snaps unlock only once the live feed has settled. Gain is locked "
-            "until that cell's offset is done.")
+            "For each cell, wait until its monitor shows a STABLE reading, then:\n"
+            "  • Empty bottle on the cell  → Snap Bottle  (Arduino OFFSET cal)\n"
+            "  • 50 g weight on the cell   → Snap 50 g    (Arduino GAIN cal)\n"
+            "Snaps unlock only once that cell has settled; gain is locked until "
+            "its offset is done. (Make cells empty, then bottles, then 50 g.)")
 
         self._offset_done: set = set()
         self._snap_btns: Dict[tuple, object] = {}
         self._cal_cells: list = []
         self._cal_present_g = 0.5
+
+        # Build the cell list up front (needed to size the per-cell monitors).
+        for exp_id in range(1, self.num_boxes + 1):
+            ch = EXPERIMENT_CHANNELS[exp_id]
+            for side, load_id in (("Left",  ch["left_load"]),
+                                   ("Right", ch["right_load"])):
+                self._cal_cells.append((exp_id, side, load_id))
 
         # Stability + presence parameters (user-editable).
         pf = tk.Frame(ctl, bg=BG_PNL); pf.pack(fill=tk.X, pady=(0, 8))
@@ -2711,10 +2832,12 @@ class MainWindow(tk.Tk):
                        ).pack(side=tk.LEFT, padx=(0, 14))
         self._cal_delay_var   = tk.StringVar(value="5")
         self._cal_thresh_var  = tk.StringVar(value="0.1")
+        self._cal_varthresh_var = tk.StringVar(value="0.0025")
         self._cal_present_var = tk.StringVar(value="0.5")
-        param("Stability delay (s):",      self._cal_delay_var,   0.5, 600, 0.5)
-        param("Stability threshold (g):",  self._cal_thresh_var,  0.001, 50, 0.01)
-        param("Weight-present min (g):",    self._cal_present_var, 0, 100, 0.1)
+        param("Stability delay (s):",       self._cal_delay_var,    0.5, 600, 0.5)
+        param("Variance thresh (g²):",      self._cal_varthresh_var, 0.0, 50, 0.0005)
+        param("Gram-spread thresh (g):",    self._cal_thresh_var,   0.001, 50, 0.01)
+        param("Weight-present min (g):",    self._cal_present_var,  0, 100, 0.1)
         self._weight_present_var = tk.StringVar(value="1")
         tk.Checkbutton(
             pf, variable=self._weight_present_var, onvalue="1", offvalue="0",
@@ -2739,17 +2862,48 @@ class MainWindow(tk.Tk):
                             "averages it, so a single jump can't skew it)",
                  font=FONT, bg=BG_PNL, fg=FG_MUT).pack(side=tk.LEFT, padx=8)
 
-        # Live load-cell feed.
-        self._cal_fig = Figure(figsize=(8, 2.2), dpi=96, facecolor=BG)
-        self._cal_ax  = self._cal_fig.add_subplot(111)
-        self._cal_fig.subplots_adjust(left=0.07, right=0.99, top=0.95, bottom=0.22)
+        # Display-mode toggle for the per-cell monitors.
+        df = tk.Frame(ctl, bg=BG_PNL); df.pack(fill=tk.X, pady=(0, 4))
+        tk.Label(df, text="Monitors show:", font=FONT, bg=BG_PNL, fg=FG
+                 ).pack(side=tk.LEFT, padx=(0, 6))
+        self._cal_disp_var = tk.StringVar(value="raw")
+        for val, lbl in (("raw", "Raw / reported values"),
+                         ("var", "Moving variance")):
+            tk.Radiobutton(df, variable=self._cal_disp_var, value=val, text=lbl,
+                           font=FONT, bg=BG_PNL, fg=FG, selectcolor=BG_ALT,
+                           activebackground=BG_PNL, activeforeground=FG
+                           ).pack(side=tk.LEFT, padx=(0, 10))
+
+        # Stability-GATE metric toggle (what the snap unlock is judged on).
+        mf = tk.Frame(ctl, bg=BG_PNL); mf.pack(fill=tk.X, pady=(0, 4))
+        tk.Label(mf, text="Stability judged by:", font=FONT, bg=BG_PNL, fg=FG
+                 ).pack(side=tk.LEFT, padx=(0, 6))
+        self._cal_metric_var = tk.StringVar(value="var")   # variance by default
+        for val, lbl in (("var",  "Moving variance (g²)"),
+                         ("gram", "Gram spread (g)")):
+            tk.Radiobutton(mf, variable=self._cal_metric_var, value=val, text=lbl,
+                           font=FONT, bg=BG_PNL, fg=FG, selectcolor=BG_ALT,
+                           activebackground=BG_PNL, activeforeground=FG
+                           ).pack(side=tk.LEFT, padx=(0, 10))
+
+        # Per-cell monitors: one stacked sub-plot per load cell, sharing ONE
+        # x-axis (time) for the whole figure but each with its OWN y-axis.
+        n = max(1, len(self._cal_cells))
+        self._cal_fig = Figure(figsize=(8, max(2.4, 0.75 * n)), dpi=96,
+                               facecolor=BG)
+        axes = self._cal_fig.subplots(n, 1, sharex=True, squeeze=False)[:, 0]
+        self._cal_axes = {}
+        for ax, (exp_id, side, load_id) in zip(axes, self._cal_cells):
+            self._cal_axes[load_id] = ax
+        self._cal_fig.subplots_adjust(left=0.10, right=0.985, top=0.985,
+                                      bottom=0.08, hspace=0.15)
         self._cal_canvas = FigureCanvasTkAgg(self._cal_fig, master=ctl)
         self._cal_canvas.get_tk_widget().pack(fill=tk.X, pady=(0, 8))
 
+        # Snap grid: Offset (empty bottle) then Gain (50 g), per cell.
         grid = tk.Frame(ctl, bg=BG_PNL)
         grid.pack(fill=tk.X)
         for col, hd in enumerate(["Exp", "Side", "ID",
-                                   "Baseline (empty)", "",
                                    "Offset (empty bottle)", "",
                                    "Gain (50 g)", "", "Status"]):
             tk.Label(grid, text=hd, font=FONTB, bg=BG_PNL, fg=FG_MUT
@@ -2759,57 +2913,41 @@ class MainWindow(tk.Tk):
         cal_loaded = (self._settings.get("ports", {})
                       .get(self._reader.port, {}).get("calibration", {}))
         r = 1
-        for exp_id in range(1, self.num_boxes + 1):
-            ch = EXPERIMENT_CHANNELS[exp_id]
-            for side, load_id in (("Left",  ch["left_load"]),
-                                   ("Right", ch["right_load"])):
-                self._cal_cells.append((exp_id, side, load_id))
-                for col, txt in ((0, str(exp_id)), (1, side), (2, f"{load_id}")):
-                    tk.Label(grid, text=txt, font=FONTM if col == 2 else FONT,
-                             bg=BG_PNL, fg=FG_MUT if col == 2 else FG
-                             ).grid(row=r, column=col, padx=5)
+        for (exp_id, side, load_id) in self._cal_cells:
+            for col, txt in ((0, str(exp_id)), (1, side), (2, f"{load_id}")):
+                tk.Label(grid, text=txt, font=FONTM if col == 2 else FONT,
+                         bg=BG_PNL, fg=FG_MUT if col == 2 else FG
+                         ).grid(row=r, column=col, padx=5)
 
-                csec   = cal_loaded.get(str(exp_id), {})
-                side_l = side.lower()
-                m = self._models[exp_id]
+            csec   = cal_loaded.get(str(exp_id), {})
+            side_l = side.lower()
+            m = self._models[exp_id]
 
-                # baseline (stage 1), offset (stage 2), gain (stage 3)
-                specs = (("baseline", "Snap baseline", self._snap_baseline),
-                         ("offset",   "Snap Bottle",   None),
-                         ("gain",     "Snap 50 g",     None))
-                for ci, (kind, btn_txt, fn) in enumerate(specs):
-                    init = csec.get(f"{kind}_weight_{side_l}")
-                    sv = tk.StringVar(value=f"{init:.1f}" if init is not None else "—")
-                    self._snap_svars[(exp_id, side, kind)] = sv
-                    if init is not None:
-                        if kind == "offset":
-                            if side == "Left":  m.offset_weight_left  = float(init)
-                            else:               m.offset_weight_right = float(init)
-                            self._offset_done.add(load_id)
-                        elif kind == "baseline":
-                            if side == "Left":  m.baseline_weight_left  = float(init)
-                            else:               m.baseline_weight_right = float(init)
-                    tk.Label(grid, textvariable=sv, font=FONTM, bg=BG_PNL,
-                             fg=FG, width=7
-                             ).grid(row=r, column=3 + ci * 2, padx=3)
-                    if fn is not None:
-                        cmd = (lambda e=exp_id, s=side, lid=load_id: fn(e, s, lid))
-                    else:
-                        cmd = (lambda e=exp_id, s=side, lid=load_id,
-                               k=kind: self._snap(e, s, lid, k))
-                    b = tk.Button(grid, text=btn_txt, font=FONTB, bg=BG_ALT,
-                                  fg=FG, relief=tk.FLAT, padx=5,
-                                  state=tk.DISABLED, command=cmd)
-                    b.grid(row=r, column=4 + ci * 2, padx=2)
-                    self._snap_btns[(exp_id, side, kind)] = b
-                    self._cal_lock_buttons.append(b)
+            for ci, (kind, btn_txt) in enumerate(
+                    (("offset", "Snap Bottle"), ("gain", "Snap 50 g"))):
+                init = csec.get(f"{kind}_weight_{side_l}")
+                sv = tk.StringVar(value=f"{init:.1f}" if init is not None else "—")
+                self._snap_svars[(exp_id, side, kind)] = sv
+                if init is not None and kind == "offset":
+                    if side == "Left":  m.offset_weight_left  = float(init)
+                    else:               m.offset_weight_right = float(init)
+                    self._offset_done.add(load_id)
+                tk.Label(grid, textvariable=sv, font=FONTM, bg=BG_PNL,
+                         fg=FG, width=7).grid(row=r, column=3 + ci * 2, padx=3)
+                b = tk.Button(grid, text=btn_txt, font=FONTB, bg=BG_ALT,
+                              fg=FG, relief=tk.FLAT, padx=5, state=tk.DISABLED,
+                              command=lambda e=exp_id, s=side, lid=load_id,
+                              k=kind: self._snap(e, s, lid, k))
+                b.grid(row=r, column=4 + ci * 2, padx=2)
+                self._snap_btns[(exp_id, side, kind)] = b
+                self._cal_lock_buttons.append(b)
 
-                stv = tk.StringVar(value="waiting for stable weight…")
-                self._snap_svars[(exp_id, side, "status")] = stv
-                tk.Label(grid, textvariable=stv, font=FONTM, bg=BG_PNL,
-                         fg=CLR_GRN, width=26
-                         ).grid(row=r, column=9, padx=8, sticky="w")
-                r += 1
+            stv = tk.StringVar(value="waiting for stable weight…")
+            self._snap_svars[(exp_id, side, "status")] = stv
+            tk.Label(grid, textvariable=stv, font=FONTM, bg=BG_PNL,
+                     fg=CLR_GRN, width=26
+                     ).grid(row=r, column=7, padx=8, sticky="w")
+            r += 1
 
         # ── All-at-once + touch calibration ───────────────────────────────────
         allrow = tk.Frame(ctl, bg=BG_PNL); allrow.pack(fill=tk.X, pady=(10, 0))
@@ -2861,7 +2999,7 @@ class MainWindow(tk.Tk):
 
         # ── Touch thresholds ──────────────────────────────────────────────────
         th = section("Touch sensitivity thresholds",
-                     "Per channel (0-7). Range 20-255, default 130. "
+                     "Per channel (0-7). Range 20-255, default 50. "
                      "Persisted in Arduino EEPROM and in lickometer_settings.json.")
         self._thresh_vars: Dict[int, tk.StringVar] = {}
         loaded_thr = (self._settings.get("ports", {})
@@ -2870,7 +3008,7 @@ class MainWindow(tk.Tk):
             r, c = divmod(ch, 4)
             tk.Label(th, text=f"Ch {ch}:", font=FONT, bg=BG_PNL, fg=FG
                      ).grid(row=r, column=c * 3, padx=(10, 2), pady=4, sticky="e")
-            v = tk.StringVar(value=str(loaded_thr.get(str(ch), 130)))
+            v = tk.StringVar(value=str(loaded_thr.get(str(ch), 50)))
             self._thresh_vars[ch] = v
             tk.Spinbox(th, from_=20, to=255, textvariable=v, width=5,
                        font=FONTM, bg=BG_ALT, fg=FG, relief=tk.FLAT
@@ -2910,11 +3048,12 @@ class MainWindow(tk.Tk):
             ("load_nochange_minutes",   "Load unchanged after licking — window (min):"),
             ("load_nolick_minutes",     "Load changed w/o licks — window (min):"),
             ("load_change_tolerance_g", "Load change tolerance (g):"),
+            ("postbout_delay_seconds",  "Post-bout weight: sec after bout ends:"),
         ]
         for i, (key, label) in enumerate(rows):
             tk.Label(f, text=label, font=FONT, bg=BG_PNL, fg=FG
                      ).grid(row=i, column=0, sticky="w", pady=5, padx=(0, 16))
-            v = tk.StringVar(value=str(flags[key]))
+            v = tk.StringVar(value=str(flags.get(key, 10)))
             self._flag_vars[key] = v
             tk.Spinbox(f, from_=0, to=999999, increment=1,
                        textvariable=v, width=10, font=FONTM,
@@ -3038,6 +3177,26 @@ class MainWindow(tk.Tk):
                    textvariable=self._plot_vars["load_linewidth"], width=8,
                    font=FONTM, bg=BG_ALT, fg=FG, relief=tk.FLAT
                    ).grid(row=1, column=1, sticky="w", padx=4)
+        # Auto load axis (vs the manual min/max above, applied to all boxes).
+        self._plot_vars["load_auto"] = tk.StringVar(
+            value=str(plot.get("load_auto", 1)))
+        tk.Checkbutton(lf, text="Auto load axis (scale min/max from data; "
+                               "uncheck to use the manual min/max for all boxes)",
+                       variable=self._plot_vars["load_auto"],
+                       onvalue="1", offvalue="0",
+                       font=FONT, bg=BG_PNL, fg=FG, selectcolor=BG_ALT,
+                       activebackground=BG_PNL, activeforeground=FG
+                       ).grid(row=2, column=0, columnspan=2, sticky="w",
+                              pady=5, padx=(0, 16))
+        tk.Label(lf, text="Plot averaging (samples per point):", font=FONT,
+                 bg=BG_PNL, fg=FG).grid(row=3, column=0, sticky="w",
+                                        pady=5, padx=(0, 16))
+        self._plot_vars["load_avg_n"] = tk.StringVar(
+            value=str(plot.get("load_avg_n", 5)))
+        tk.Spinbox(lf, from_=1, to=100, increment=1,
+                   textvariable=self._plot_vars["load_avg_n"], width=8,
+                   font=FONTM, bg=BG_ALT, fg=FG, relief=tk.FLAT
+                   ).grid(row=3, column=1, sticky="w", padx=4)
 
         # ── Titles, axis labels, fonts & legend (Task L6-L13, L9, L10, LG21) ──
         FONT_CHOICES = ["DejaVu Sans", "DejaVu Serif", "DejaVu Sans Mono",
@@ -3314,7 +3473,9 @@ class MainWindow(tk.Tk):
             fv.reconfigure(fp["full_rows"], fp["full_seconds_per_row"],
                            fp["full_bin_seconds"])
             fv.set_load_axis(pv["load_ymin"], pv["load_ymax"],
-                             show=show, linewidth=lw)
+                             yticks=pv["load_yticks"], show=show, linewidth=lw,
+                             auto=bool(pv.get("load_auto", 1)),
+                             avg_n=int(pv.get("load_avg_n", 5)))
             fv.update_view(self._models[exp_id].get_log())
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -3450,13 +3611,11 @@ class MainWindow(tk.Tk):
 
     def _init_cell_settled(self, load_id: int) -> bool:
         """A load cell counts as settled once it has ≥2 readings and its last few
-        readings lie within the stability threshold (works at any stream rate)."""
+        readings pass the selected stability metric (works at any stream rate)."""
         buf = self._cal_buf.get(int(load_id), [])
         if len(buf) < 2:
             return False
-        _, thresh, _ = self._cal_params()
-        last = [v for (_, v) in buf[-3:]]
-        return (max(last) - min(last)) <= thresh
+        return self._metric_ok([v for (_, v) in buf[-4:]])
 
     def _check_init_stable(self):
         """Poll until every active load cell has settled (or the safety cap)."""
@@ -3525,8 +3684,8 @@ class MainWindow(tk.Tk):
         save_port_section(self._reader.port, "thresholds", {str(ch): n})
 
     def _cal_params(self):
-        """Stability delay (s), threshold (g) and weight-present threshold (g)
-        from the calibration tab, with safe fallbacks."""
+        """Stability delay (s), gram threshold (g) and weight-present threshold
+        (g) from the calibration tab, with safe fallbacks."""
         def f(attr, default):
             try:
                 return float(getattr(self, attr).get())
@@ -3536,10 +3695,33 @@ class MainWindow(tk.Tk):
                 max(0.001, f("_cal_thresh_var", 0.1)),
                 max(0.0, f("_cal_present_var", 0.5)))
 
+    def _stability_metric(self) -> str:
+        """'var' (moving variance, g²) or 'gram' (peak-to-peak spread, g)."""
+        return (self._cal_metric_var.get()
+                if hasattr(self, "_cal_metric_var") else "var")
+
+    def _cal_var_thresh(self) -> float:
+        """Variance threshold (g²) for the stability gate."""
+        try:
+            return max(1e-9, float(self._cal_varthresh_var.get()))
+        except (AttributeError, ValueError, tk.TclError):
+            return 0.0025
+
+    def _metric_ok(self, vals) -> bool:
+        """Whether a set of readings is 'stable' under the selected metric."""
+        if len(vals) < 2:
+            return False
+        if self._stability_metric() == "gram":
+            _, gram_thresh, _ = self._cal_params()
+            return (max(vals) - min(vals)) <= gram_thresh
+        mean = sum(vals) / len(vals)
+        var  = sum((v - mean) ** 2 for v in vals) / len(vals)
+        return var <= self._cal_var_thresh()
+
     def _cell_stable(self, load_id: int) -> bool:
-        """True when the cell's recent readings span ≥ delay seconds and lie
-        within the stability threshold (g) of each other."""
-        delay, thresh, _ = self._cal_params()
+        """True when the cell's recent readings span ≥ delay seconds and pass the
+        selected stability metric (variance by default, or gram spread)."""
+        delay, _, _ = self._cal_params()
         buf = self._cal_buf.get(int(load_id), [])
         if len(buf) < 2:
             return False
@@ -3549,44 +3731,72 @@ class MainWindow(tk.Tk):
             return False
         if (recent[-1][0] - recent[0][0]) < delay * 1000.0 * 0.6:
             return False                       # window not yet long enough
-        vals = [v for (_, v) in recent]
-        return (max(vals) - min(vals)) <= thresh
+        return self._metric_ok([v for (_, v) in recent])
+
+    @staticmethod
+    def _moving_variance(ts, ys, win_ms):
+        """Trailing moving variance of ys over a win_ms window at each point."""
+        out = []
+        j = 0
+        for i in range(len(ts)):
+            while ts[i] - ts[j] > win_ms:
+                j += 1
+            seg = ys[j:i + 1]
+            if len(seg) >= 2:
+                mean = sum(seg) / len(seg)
+                out.append(sum((v - mean) ** 2 for v in seg) / len(seg))
+            else:
+                out.append(0.0)
+        return out
 
     def _draw_cal_feed(self, delay):
-        """Redraw the live load-cell feed (recent grams per active cell)."""
-        ax = self._cal_ax
-        ax.cla()
-        ax.set_facecolor(BG_PNL)
-        for sp in ax.spines.values():
-            sp.set_color(BG_ALT)
+        """Redraw each load cell's own monitor: shared x-axis (time), individual
+        y-axis. Mode toggle shows raw/reported grams or the moving variance."""
         now = self._arduino_ts[0]
         win_ms = max(30.0, delay * 5.0) * 1000.0
-        plotted = False
-        for (exp_id, side, load_id) in self._cal_cells:
+        var_win_ms = max(2.0, delay) * 1000.0
+        mode = (self._cal_disp_var.get()
+                if hasattr(self, "_cal_disp_var") else "raw")
+        cells = self._cal_cells
+        for idx, (exp_id, side, load_id) in enumerate(cells):
+            ax = self._cal_axes.get(load_id)
+            if ax is None:
+                continue
+            ax.cla()
+            ax.set_facecolor(BG_PNL)
+            for sp in ax.spines.values():
+                sp.set_color(BG_ALT)
+            ax.tick_params(colors=FG_MUT, labelsize=6)
+            color = CLR_L if side == "Left" else CLR_R
             buf = self._cal_buf.get(load_id, [])
             pts = [(t, v) for (t, v) in buf if t >= now - win_ms]
-            if not pts:
-                continue
-            xs = [(t - now) / 1000.0 for (t, _) in pts]
-            ys = [v for (_, v) in pts]
-            color = CLR_L if side == "Left" else CLR_R
-            ax.plot(xs, ys, color=color, linewidth=1.2, marker="o",
-                    markersize=2, label=f"B{exp_id} {side[0]} (id{load_id})")
-            plotted = True
-        ax.set_xlabel("seconds ago", color=FG_MUT, fontsize=7)
-        ax.set_ylabel("grams", color=FG_MUT, fontsize=7)
-        ax.tick_params(colors=FG_MUT, labelsize=6)
-        if plotted:
-            ax.legend(loc="upper left", fontsize=5, ncol=4, framealpha=0.2,
-                      facecolor=BG_PNL, edgecolor=BG_ALT, labelcolor=FG)
-        else:
-            ax.text(0.5, 0.5, "waiting for load-cell stream…",
-                    ha="center", va="center", color=FG_MUT, fontsize=8,
-                    transform=ax.transAxes)
+            if pts:
+                tms = [t for (t, _) in pts]
+                xs  = [(t - now) / 1000.0 for t in tms]
+                raw = [v for (_, v) in pts]
+                if mode == "var":
+                    ys = self._moving_variance(tms, raw, var_win_ms)
+                    yl = "var(g²)"
+                else:
+                    ys = raw
+                    yl = "g"
+                ax.plot(xs, ys, color=color, linewidth=1.1, marker="o",
+                        markersize=1.8)
+            else:
+                yl = "g"
+                ax.text(0.5, 0.5, "waiting…", ha="center", va="center",
+                        color=FG_MUT, fontsize=7, transform=ax.transAxes)
+            ax.set_ylabel(f"B{exp_id}{side[0]} id{load_id}\n{yl}",
+                          color=FG_MUT, fontsize=6, rotation=0,
+                          ha="right", va="center", labelpad=18)
+            if idx == len(cells) - 1:
+                ax.set_xlabel("seconds ago", color=FG_MUT, fontsize=7)
+            else:
+                ax.tick_params(labelbottom=False)
         self._cal_canvas.draw_idle()
 
     def _cal_tick(self):
-        """Periodic: redraw live feed, evaluate per-cell stability, enable/disable
+        """Periodic: redraw monitors, evaluate per-cell stability, enable/disable
         snap buttons and update status messages."""
         if not getattr(self, "_cal_built", False):
             return
@@ -3599,13 +3809,11 @@ class MainWindow(tk.Tk):
         locked = getattr(self, "_cal_locked", False)
         for (exp_id, side, load_id) in self._cal_cells:
             stable = self._cell_stable(load_id)
-            base_b = self._snap_btns.get((exp_id, side, "baseline"))
             off_b  = self._snap_btns.get((exp_id, side, "offset"))
             gain_b = self._snap_btns.get((exp_id, side, "gain"))
             if not locked:
-                for b in (base_b, off_b):
-                    if b is not None:
-                        b.config(state=tk.NORMAL if stable else tk.DISABLED)
+                if off_b is not None:
+                    off_b.config(state=tk.NORMAL if stable else tk.DISABLED)
                 if gain_b is not None:
                     ok = stable and (load_id in self._offset_done)
                     gain_b.config(state=tk.NORMAL if ok else tk.DISABLED)
@@ -3620,27 +3828,11 @@ class MainWindow(tk.Tk):
                 if not stable:
                     tail = "waiting for stable weight…"
                 elif load_id not in self._offset_done:
-                    tail = "stable — snap baseline/offset"
+                    tail = "stable — snap bottle (offset)"
                 else:
-                    tail = "stable — snap gain"
+                    tail = "stable — snap 50 g (gain)"
                 sv.set(("  ".join(done) + "   " if done else "") + tail)
         self._cal_job = self.after(500, self._cal_tick)
-
-    def _snap_baseline(self, exp_id: int, side: str, load_id: int):
-        """Stage 1: capture the EMPTY-CELL stable baseline (no Arduino action)."""
-        if not self._cell_stable(load_id):
-            messagebox.showwarning("Not stable",
-                f"Load ID {load_id} hasn't stabilized yet.")
-            return
-        live = self._last_raw.get(load_id)
-        self._snap_svars[(exp_id, side, "baseline")].set(
-            f"{live:.1f}" if live is not None else "—")
-        m = self._models[exp_id]
-        if side == "Left":  m.baseline_weight_left  = live
-        else:               m.baseline_weight_right = live
-        self._persist_cal(exp_id, side, "baseline", live)
-        self.emit_alert(None, f"Box {exp_id} {side}: empty-cell baseline "
-                              f"captured ({live:.2f} g)", level="info")
 
     def _apply_drift_settings(self, initial: bool = False):
         """Push drift settings to every model and persist them (shared)."""
@@ -3839,6 +4031,10 @@ class MainWindow(tk.Tk):
         save_shared("flags", vals)                       # Task 3
         # reload into our cached settings so flag_settings() stays consistent
         self._settings["shared"]["flags"].update(vals)
+        # C6: push the post-bout delay to every model.
+        pbd = float(vals.get("postbout_delay_seconds", 10))
+        for m in self._models.values():
+            m.postbout_delay_s = pbd
         self.emit_alert(None, "flag thresholds updated", level="info")
 
     def _apply_load_capture(self):
@@ -3906,7 +4102,9 @@ class MainWindow(tk.Tk):
             fv.reconfigure(fp["full_rows"], fp["full_seconds_per_row"],
                            fp["full_bin_seconds"])
             fv.set_load_axis(vals["load_ymin"], vals["load_ymax"],
-                             show=show, linewidth=lw)
+                             yticks=vals["load_yticks"], show=show, linewidth=lw,
+                             auto=bool(vals.get("load_auto", 1)),
+                             avg_n=int(vals.get("load_avg_n", 5)))
             fv.update_view(self._models[exp_id].get_log())
 
         self.emit_alert(None, "raster plot visuals updated", level="info")
