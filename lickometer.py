@@ -1,22 +1,15 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Tue Jun 23 12:22:24 2026
-
-@author: readj
-"""
-
 """
 lickometer_final.py  —  Lickometer GUI (single file)
 Run:   python lickometer_final.py [COM_PORT]
 Deps:  pip install pyserial matplotlib numpy
-
+ 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RUNNING MULTIPLE INSTANCES  (Task 1)
-
+ 
   Each running copy of this program drives ONE Arduino (its own COM port)
   and the 4 experiments on that board. To run four boards at once on the
   same computer, start the program four times, one per COM port. Options:
-
+ 
     • From a terminal (recommended, fully independent processes):
           python lickometer_final.py COM3
           python lickometer_final.py COM4
@@ -24,51 +17,51 @@ RUNNING MULTIPLE INSTANCES  (Task 1)
           python lickometer_final.py COM6
       The COM port passed on the command line just pre-fills the Port box.
       You can also type / change the port in the GUI before connecting.
-
+ 
     • From Spyder: open a new console per board
       (Consoles ▸ Open an IPython console) and run the file in each, OR
       set Run ▸ Configuration ▸ "Execute in an external system terminal"
       and launch it once per board. Set a different port in each GUI.
-
+ 
   The window title shows the active port so the four windows are easy to
   tell apart. Calibration is stored per-port; flag / plot / save settings
   are shared across all instances (see Task 3 below).
-
+ 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ARDUINO SERIAL PROTOCOL  (from lickometer_risha_final.ino)
-
+ 
   Every line during streaming:
       timestamp_ms,id,amplitude
       e.g.  14523,0,12.4    ← board-0 right load, 12.4 g
             14650,8,1       ← ch-0 lick onset
             14780,16,0      ← ch-0 lick offset
-
+ 
   ID map:
       0-7   load cells   (0=brd0-right, 1=brd0-left, 2=brd1-right … 7=brd3-left)
       8-15  lick ONSET   (channels 0-7)
       16-23 lick OFFSET  (channels 0-7, i.e. onset_id + 8)
-
+ 
   Lines starting with '#' are comments/headers and are silently ignored.
   Everything else that doesn't match  digits,digits,number  is ignored.
-
+ 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Edit only the USER CONFIGURATION block below. Anything you set in the GUI
 (calibration, flag thresholds, plot axes, save folder) is persisted to
 lickometer_settings.json and re-loaded automatically next time (Task 3),
 so these constants are only the first-run defaults.
 """
-
+ 
 # ══════════════════════════════════════════════════════════════════════════════
 # USER CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
-
+ 
 SERIAL_PORT     = "COM3"       # Linux/Mac: "/dev/ttyUSB0" or "/dev/cu.usbserial-…"
 BAUD_RATE       = 115200
-
-TIMEBIN_MS      = 500           # raster bin width in ms
+ 
+TIMEBIN_MS      = 1000           # raster bin width in ms
 GUI_REFRESH_MS  = 1000         # raster redraw interval in ms
-SECONDS_PER_ROW = 3600           # x-axis span per raster row (seconds)
-
+SECONDS_PER_ROW = 600           # x-axis span per raster row (seconds)
+ 
 # Map experiment 1-4 to Arduino channel IDs.
 #   left/right lick onset IDs are 8-15; offset = onset + 8
 #   load cell IDs are 0-7
@@ -80,7 +73,7 @@ EXPERIMENT_CHANNELS = {
     3: {"left_onset": 13, "right_onset": 12, "left_load": 5, "right_load": 4},
     4: {"left_onset": 15, "right_onset": 14, "left_load": 7, "right_load": 6},
 }
-
+ 
 # ── Flag / watchdog thresholds (Task 2) — first-run defaults, editable in GUI ──
 NO_LICK_MINUTES         = 30    # 2b: flag if no lick at all for longer than this
 PROLONGED_BOUT_MINUTES  = 1     # 2b: flag a continuous lick bout longer than this
@@ -89,29 +82,29 @@ BOUT_GAP_SECONDS        = 10    # 2b: a gap longer than this ends a lick "bout"
 LOAD_NOCHANGE_MINUTES   = 30    # 2c: sample window — licks but load unchanged
 LOAD_NOLICK_MINUTES     = 30    # 2c: sample window — load changed but no licks
 LOAD_CHANGE_TOLERANCE_G = 0.5   # 2c: load swing (g) below this counts as "no change"
-
+ 
 # ── Raster plot visuals (Task 5) — first-run defaults, editable in GUI ──
 LOAD_YMIN   = 0.0     # bottom of the load-cell scale (g)
 LOAD_YMAX   = 60.0    # top of the load-cell scale (g)
 LOAD_YTICKS = 4       # number of tick marks on the load-cell scale
-
+ 
 # ── Autosave (Task 6) ──
 AUTOSAVE_HOURS = 6     # autosave each running experiment to the save folder
-
+ 
 # ── Watchdog poll interval (how often flag conditions are checked) ──
 WATCHDOG_MS = 2000
-
+ 
 # ══════════════════════════════════════════════════════════════════════════════
 # END USER CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
-
+ 
 import sys, threading, queue, time, re, datetime, os, json, builtins
 from typing import List, Optional, Dict, Tuple
 from dataclasses import dataclass
-
+ 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-
+ 
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
@@ -119,16 +112,16 @@ import matplotlib.patches as mpatches
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import numpy as np
-
+ 
 try:
     import serial as _serial
     _SERIAL_OK = True
 except ImportError:
     _SERIAL_OK = False
-
+ 
 # ── Derived ────────────────────────────────────────────────────────────────────
 BINS_PER_ROW = (SECONDS_PER_ROW * 1000) // TIMEBIN_MS  # 1200 at defaults
-
+ 
 # ── Palette (dark theme) ───────────────────────────────────────────────────────
 BG      = "#1C1C1E"
 BG_PNL  = "#2C2C2E"
@@ -140,11 +133,11 @@ CLR_R   = "#4DA6FF"   # right lick / right load
 CLR_EXP = "#FFD60A"   # onset/offset markers
 CLR_GRN = "#30D158"
 CLR_RED = "#FF453A"
-
+ 
 FONT    = ("Segoe UI", 9)
 FONTB   = ("Segoe UI", 9, "bold")
 FONTM   = ("Courier New", 9)
-
+ 
 # ══════════════════════════════════════════════════════════════════════════════
 # SETTINGS PERSISTENCE  (Task 3)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -158,13 +151,13 @@ FONTM   = ("Courier New", 9)
 # Saves are atomic (write temp + os.replace) and merge-on-write (re-read the
 # file, update only this instance's section, write back) so four instances can
 # share one file without clobbering each other.
-
+ 
 try:
     _HERE = os.path.dirname(os.path.abspath(__file__))
 except NameError:                       # e.g. interactive / some Spyder configs
     _HERE = os.getcwd()
 SETTINGS_FILE = os.path.join(_HERE, "lickometer_settings.json")
-
+ 
 DEFAULT_SETTINGS = {
     "shared": {
         "flags": {
@@ -187,8 +180,8 @@ DEFAULT_SETTINGS = {
     # "ports": { "COM3": {"thresholds": {...}, "calibration": {...}}, ... }
     "ports": {},
 }
-
-
+ 
+ 
 def _deep_merge(base: dict, over: dict) -> dict:
     """Return base updated with over (recursively); base is not mutated."""
     out = dict(base)
@@ -198,18 +191,20 @@ def _deep_merge(base: dict, over: dict) -> dict:
         else:
             out[k] = v
     return out
-
-
+ 
+ 
 def load_settings() -> dict:
+    """Load settings from JSON file, merging with defaults for any missing keys."""
     try:
         with open(SETTINGS_FILE, "r") as f:
             data = json.load(f)
     except Exception:
         data = {}
     return _deep_merge(DEFAULT_SETTINGS, data)
-
-
+ 
+ 
 def _write_settings(data: dict):
+    """Atomically write the settings dict to JSON (temp-file + os.replace)."""
     tmp = SETTINGS_FILE + ".tmp"
     try:
         with open(tmp, "w") as f:
@@ -217,8 +212,8 @@ def _write_settings(data: dict):
         os.replace(tmp, SETTINGS_FILE)          # atomic on the same filesystem
     except Exception as e:
         print(f"[settings] save failed: {e}")
-
-
+ 
+ 
 def save_shared(section: str, values: dict):
     """Re-read file, update shared[section], write back (merge-on-write)."""
     data = load_settings()
@@ -228,14 +223,15 @@ def save_shared(section: str, values: dict):
     else:
         data["shared"][section] = values
     _write_settings(data)
-
-
+ 
+ 
 def save_shared_value(key: str, value):
+    """Update a single top-level shared key in the settings file."""
     data = load_settings()
     data.setdefault("shared", {})[key] = value
     _write_settings(data)
-
-
+ 
+ 
 def save_port_section(port: str, section: str, values: dict):
     """Update ports[port][section] (e.g. 'thresholds' or 'calibration')."""
     data = load_settings()
@@ -246,7 +242,7 @@ def save_port_section(port: str, section: str, values: dict):
     else:
         p[section] = values
     _write_settings(data)
-
+ 
 # ══════════════════════════════════════════════════════════════════════════════
 # PORT CLEANUP  (Task 4)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -260,12 +256,12 @@ def save_port_section(port: str, section: str, values: dict):
 # NOTE: a port held by a *different OS process* cannot be force-released from
 # Python on Windows. If the open still fails, we surface the clear "unable to
 # connect - check connection" error (Task 2a) so you know to close other apps.
-
+ 
 if not hasattr(builtins, "_LICKOMETER_OPEN_PORTS"):
     builtins._LICKOMETER_OPEN_PORTS = {}
 _OPEN_PORTS: dict = builtins._LICKOMETER_OPEN_PORTS   # {port_name: serial.Serial}
-
-
+ 
+ 
 def cleanup_port(port: str):
     """Close any serial handle this kernel/process is still holding on `port`."""
     obj = _OPEN_PORTS.pop(port, None)
@@ -285,26 +281,27 @@ def cleanup_port(port: str):
                 _OPEN_PORTS.pop(p, None)
         except Exception:
             _OPEN_PORTS.pop(p, None)
-
+ 
 # ══════════════════════════════════════════════════════════════════════════════
 # SERIAL READER
 # ══════════════════════════════════════════════════════════════════════════════
-
+ 
 _EVT_RE = re.compile(r"^(\d+),(\d+),([\d.+-]+)$")
-
-
+ 
+ 
 class SerialReader:
     """
     Background thread reads Arduino serial output.
     Parsed events  → self.queue       {"ts":int,"id":int,"amp":float}
     Raw text lines → self.raw_queue   str   (for the terminal tab)
-
+ 
     Task 2a: connect() NO LONGER falls back to simulation on failure. It closes
     stale handles first (Task 4), tries to open, and returns True/False. The
     simulation code below is kept but its call sites are commented out.
     """
-
+ 
     def __init__(self):
+        """Initialise queues, serial state, and connection metadata."""
         self.queue       = queue.Queue()
         self.raw_queue   = queue.Queue(maxsize=500)
         self._ser        = None
@@ -313,8 +310,12 @@ class SerialReader:
         self.port        = SERIAL_PORT
         self.baud        = BAUD_RATE
         self.last_error  = ""
-
+        # Protects all access to self._ser so that send() (called from the
+        # Tk main thread) and _read_loop() (background thread) never race.
+        self._ser_lock   = threading.Lock()
+ 
     def connect(self) -> bool:
+        """Open the serial port and start the background reader thread. Returns True on success."""
         if not _SERIAL_OK:
             self.last_error = "pyserial not installed (pip install pyserial)"
             self._push_raw(f"[Serial] {self.last_error}")
@@ -323,8 +324,10 @@ class SerialReader:
             return False
         cleanup_port(self.port)                       # Task 4
         try:
-            self._ser     = _serial.Serial(self.port, self.baud, timeout=1)
-            _OPEN_PORTS[self.port] = self._ser        # register for Task 4 cleanup
+            ser = _serial.Serial(self.port, self.baud, timeout=1)
+            with self._ser_lock:
+                self._ser = ser
+            _OPEN_PORTS[self.port] = ser              # register for Task 4 cleanup
             self._running = True
             threading.Thread(target=self._read_loop, daemon=True).start()
             self.last_error = ""
@@ -335,27 +338,47 @@ class SerialReader:
             print(f"[Serial] {e}")
             # self._start_sim()   # Task 2a: do NOT auto-fall-back to simulation
             return False
-
+ 
     def send(self, cmd: str):
-        if self._ser and self._ser.is_open:
-            self._ser.write((cmd + "\r\n").encode())
+        """Send a newline-terminated command to the Arduino under the serial lock.
+ 
+        _ser_lock prevents this from racing with _read_loop(), which also
+        acquires the lock during each readline() call. _push_raw is outside
+        the lock because it only touches the thread-safe raw_queue.
+        """
+        with self._ser_lock:
+            if self._ser and self._ser.is_open:
+                self._ser.write((cmd + "\r\n").encode())
         self._push_raw(f">> {cmd}")
-
+ 
     def disconnect(self):
+        """Stop the reader thread and close the serial port."""
         self._running = False
-        if self._ser:
-            try:
-                self._ser.close()
-            except Exception:
-                pass
-            _OPEN_PORTS.pop(self.port, None)          # Task 4: deregister
-
+        with self._ser_lock:
+            if self._ser:
+                try:
+                    self._ser.close()
+                except Exception:
+                    pass
+                _OPEN_PORTS.pop(self.port, None)      # Task 4: deregister
+ 
     # ── Internal ──────────────────────────────────────────────────────────────
-
+ 
     def _read_loop(self):
+        """Background thread: reads lines from the serial port and puts parsed events on the queue.
+ 
+        Each readline() is wrapped in _ser_lock so it cannot run concurrently
+        with send() or disconnect().  Only serial.SerialException is silently
+        swallowed (and logged); other exceptions are re-raised so genuine bugs
+        are not hidden.
+        """
         while self._running:
             try:
-                raw = self._ser.readline()
+                with self._ser_lock:
+                    if not (self._ser and self._ser.is_open):
+                        # Port closed externally — stop the loop cleanly.
+                        break
+                    raw = self._ser.readline()
                 if not raw:
                     continue
                 line = raw.decode("utf-8", errors="ignore").strip()
@@ -363,13 +386,19 @@ class SerialReader:
                 msg = self._parse(line)
                 if msg:
                     self.queue.put(msg)
-            except Exception as e:
-                # Task 2: an I/O hiccup must not stop the program. Log and keep going.
-                self._push_raw(f"[Serial] read error: {e}")
+            except _serial.SerialException as e:
+                # Transient port error (e.g. USB glitch). Log once and retry.
+                self._push_raw(f"[Serial] {e}")
                 print(f"[Serial] {e}")
                 time.sleep(0.1)
-
+            except Exception as e:
+                # Unexpected error — log it but keep running.
+                self._push_raw(f"[Serial] unexpected: {e}")
+                print(f"[Serial] unexpected: {e}")
+                time.sleep(0.1)
+ 
     def _parse(self, line: str):
+        """Parse one raw serial line into an event dict, or return None if unrecognised."""
         if line.startswith("#"):
             return None
         m = _EVT_RE.match(line)
@@ -377,30 +406,33 @@ class SerialReader:
             return {"ts": int(m.group(1)), "id": int(m.group(2)),
                     "amp": float(m.group(3))}
         return None
-
+ 
     def _push_raw(self, line: str):
+        """Push a raw text line onto raw_queue for the terminal tab (non-blocking, drops on overflow)."""
         try:
             self.raw_queue.put_nowait(line)
         except queue.Full:
             pass
-
+ 
     # ── Simulation (RETAINED for manual testing, but never auto-started) ───────
     # To test the GUI without hardware you can manually call self._start_sim()
     # from a console; nothing in normal operation calls it anymore.
-
+ 
     def _start_sim(self):
+        """Start the simulation loop (no hardware needed; for offline GUI testing only)."""
         self.sim_mode = True
         self._running = True
         threading.Thread(target=self._sim_loop, daemon=True).start()
-
+ 
     def _sim_loop(self):
+        """Generate synthetic lick and load-cell events at a 50 ms tick rate for offline testing."""
         import random, math
         t         = 0
         lick_on   = {i: False for i in range(8)}
         lick_rem  = {i: 0     for i in range(8)}
         load_base = [12000, 11500, 13000, 12800, 11200, 13500, 12200, 11800]
         load_tick = 0
-
+ 
         while self._running:
             t += 50
             for ch in range(8):
@@ -420,7 +452,7 @@ class SerialReader:
                         msg = {"ts": t, "id": on_id, "amp": 1.0}
                         self.queue.put(msg)
                         self._push_raw(f"{t},{on_id},1")
-
+ 
             load_tick += 50
             if load_tick >= 200:
                 load_tick = 0
@@ -428,19 +460,19 @@ class SerialReader:
                     val = load_base[ld] + math.sin(t / 9000) * 400 + random.gauss(0, 12)
                     self.queue.put({"ts": t, "id": ld, "amp": round(val, 1)})
                     self._push_raw(f"{t},{ld},{val:.1f}")
-
+ 
             time.sleep(0.05)
-
+ 
 # ══════════════════════════════════════════════════════════════════════════════
 # EXPERIMENT MODEL
 # ══════════════════════════════════════════════════════════════════════════════
-
+ 
 # Internal event IDs (saved to .npy — independent of Arduino IDs)
 _EXP_ONSET  = 0;  _EXP_OFFSET  = 1
 _L_ON       = 2;  _L_OFF       = 3
 _R_ON       = 4;  _R_OFF       = 5
 _L_LOAD     = 6;  _R_LOAD      = 7
-
+ 
 _EVT_NAME = {
     _EXP_ONSET: "Exp onset",   _EXP_OFFSET: "Exp offset",
     _L_ON:      "L lick ON",   _L_OFF:      "L lick OFF",
@@ -453,8 +485,8 @@ _EVT_TAG = {
     _R_ON:      "right",_R_OFF:      "right",
     _L_LOAD:    "load", _R_LOAD:     "load",
 }
-
-
+ 
+ 
 def _open_onset(ons: List[int], offs: List[int]) -> Optional[int]:
     """Earliest lick onset that has no matching offset yet (currently open)."""
     pool = sorted(offs)
@@ -464,17 +496,18 @@ def _open_onset(ons: List[int], offs: List[int]) -> Optional[int]:
             return on
         pool.remove(nxt)
     return None
-
-
+ 
+ 
 @dataclass
 class EventRow:
     timestamp_ms: int
     event_id:     int
     amplitude:    float
-
-
+ 
+ 
 class ExperimentModel:
     def __init__(self, exp_id: int):
+        """Set up channel ID mappings, calibration ratios, load-cell flag state, and an empty event log."""
         self.exp_id = exp_id
         ch = EXPERIMENT_CHANNELS[exp_id]
         self.l_on_id   = ch["left_onset"]
@@ -483,37 +516,61 @@ class ExperimentModel:
         self.r_off_id  = self.r_on_id  + 8
         self.l_load_id = ch["left_load"]
         self.r_load_id = ch["right_load"]
-
-        self.cal_left:  float = 1.0
-        self.cal_right: float = 1.0
-
+ 
+        self.cal_left:  float = 1.0   # software calibration ratio for left load cell
+        self.cal_right: float = 1.0   # software calibration ratio for right load cell
+ 
+        # ── Load-cell flag baselines (populated at runtime) ──────────────────
+        # initial_load_*  : the very first calibrated reading after experiment starts;
+        #                   flag fires if reading exceeds this by +0.5 g (drink event).
+        # offset_weight_* : the empty-bottle snap weight from calibration UI;
+        #                   flag fires if reading drops below this (bottle removed / empty).
+        self.initial_load_left:   Optional[float] = None  # first L load reading this run
+        self.initial_load_right:  Optional[float] = None  # first R load reading this run
+        self.offset_weight_left:  Optional[float] = None  # empty-bottle weight, left side
+        self.offset_weight_right: Optional[float] = None  # empty-bottle weight, right side
+ 
+        # Threshold above initial weight that counts as a "drink detected" flag (g)
+        self.DRINK_DELTA_G: float = 0.5
+ 
+        # Edge-trigger guards for load-cell flags so they fire once per transition
+        self._drink_flag_left:  bool = False  # True while left drink flag is active
+        self._drink_flag_right: bool = False  # True while right drink flag is active
+        self._below_flag_left:  bool = False  # True while left below-offset flag is active
+        self._below_flag_right: bool = False  # True while right below-offset flag is active
+ 
         self._log:  List[EventRow] = []
         self._lock  = threading.Lock()
         self.running:  bool          = False
         self.start_ts: Optional[int] = None
-
+ 
         # Task 2 flag-detection state (edge-triggered so flags don't spam)
         self._fs:          Dict[str, bool] = {}
         self._load_a_last: int = 0     # last time the "no change" check sampled
         self._load_b_last: int = 0     # last time the "change w/o licks" check sampled
-
+ 
     def owns(self, aid: int) -> bool:
+        """Return True if the given Arduino ID belongs to this experiment's channels."""
         return aid in (self.l_on_id, self.r_on_id,
                        self.l_off_id, self.r_off_id,
                        self.l_load_id, self.r_load_id)
-
+ 
     def elapsed(self, ts: int) -> int:
+        """Return milliseconds elapsed since experiment start, clamped to 0."""
         return max(0, ts - self.start_ts) if self.start_ts is not None else 0
-
+ 
     def add(self, ts_ms: int, eid: int, amp: float = 0.0):
+        """Append one EventRow to the thread-safe event log."""
         with self._lock:
             self._log.append(EventRow(ts_ms, eid, amp))
-
+ 
     def get_log(self) -> List[EventRow]:
+        """Return a snapshot copy of the event log (thread-safe)."""
         with self._lock:
             return list(self._log)
-
+ 
     def export_npy(self, path: str):
+        """Save the event log as a structured NumPy .npy file with fields timestamp_ms, event_id, amplitude."""
         log = self.get_log()
         if not log:
             return
@@ -523,19 +580,89 @@ class ExperimentModel:
                    ("event_id",     np.int8),
                    ("amplitude",    np.float32)])
         np.save(path, arr)
-
+ 
     def ingest(self, ts: int, aid: int, amp: float):
+        """
+        Route one Arduino event into the log and run load-cell flag checks.
+ 
+        Load-cell flags (both edge-triggered, fire once per transition):
+          • Drink flag  : calibrated weight exceeds initial_load by DRINK_DELTA_G.
+            Stored in _drink_flag_left / _drink_flag_right; returned as a flag
+            string the first time the threshold is crossed.
+          • Below-offset flag : calibrated weight drops below the empty-bottle
+            snap weight (offset_weight_left / offset_weight_right).
+            Fires once when the reading first goes below the baseline.
+ 
+        Returns a list of flag strings (empty list if no new flags this call).
+        The caller (dispatch loop in MainWindow) should forward these to emit_alert.
+        """
         if not self.running:
-            return
-        el = self.elapsed(ts)
-        if   aid == self.l_on_id:  self.add(el, _L_ON,  1.0)
-        elif aid == self.l_off_id: self.add(el, _L_OFF, 1.0)
-        elif aid == self.r_on_id:  self.add(el, _R_ON,  1.0)
-        elif aid == self.r_off_id: self.add(el, _R_OFF, 1.0)
-        elif aid == self.l_load_id:self.add(el, _L_LOAD, amp * self.cal_left)
-        elif aid == self.r_load_id:self.add(el, _R_LOAD, amp * self.cal_right)
-
+            return []
+        el   = self.elapsed(ts)
+        flags: List[str] = []
+ 
+        # ── Touch events ─────────────────────────────────────────────────────
+        if   aid == self.l_on_id:  self.add(el, _L_ON,  1.0); return flags
+        elif aid == self.l_off_id: self.add(el, _L_OFF, 1.0); return flags
+        elif aid == self.r_on_id:  self.add(el, _R_ON,  1.0); return flags
+        elif aid == self.r_off_id: self.add(el, _R_OFF, 1.0); return flags
+ 
+        # ── Load cell events ──────────────────────────────────────────────────
+        elif aid == self.l_load_id:
+            cal_val = amp * self.cal_left   # apply software calibration ratio
+ 
+            # Capture the very first reading as the initial baseline.
+            if self.initial_load_left is None:
+                self.initial_load_left = cal_val
+ 
+            self.add(el, _L_LOAD, cal_val)
+ 
+            # Flag 1: drink detected — weight rose more than DRINK_DELTA_G above initial
+            if self.initial_load_left is not None:
+                drink_now = cal_val >= self.initial_load_left + self.DRINK_DELTA_G
+                if drink_now and not self._drink_flag_left:
+                    flags.append(f"Exp {self.exp_id} L: drink detected "
+                                 f"(+{cal_val - self.initial_load_left:.2f} g above initial)")
+                self._drink_flag_left = drink_now
+ 
+            # Flag 2: below-offset — weight dropped below the empty-bottle baseline
+            if self.offset_weight_left is not None:
+                below_now = cal_val < self.offset_weight_left
+                if below_now and not self._below_flag_left:
+                    flags.append(f"Exp {self.exp_id} L: load below offset weight "
+                                 f"({cal_val:.2f} g < offset {self.offset_weight_left:.2f} g)")
+                self._below_flag_left = below_now
+ 
+        elif aid == self.r_load_id:
+            cal_val = amp * self.cal_right  # apply software calibration ratio
+ 
+            # Capture the very first reading as the initial baseline.
+            if self.initial_load_right is None:
+                self.initial_load_right = cal_val
+ 
+            self.add(el, _R_LOAD, cal_val)
+ 
+            # Flag 1: drink detected — weight rose more than DRINK_DELTA_G above initial
+            if self.initial_load_right is not None:
+                drink_now = cal_val >= self.initial_load_right + self.DRINK_DELTA_G
+                if drink_now and not self._drink_flag_right:
+                    flags.append(f"Exp {self.exp_id} R: drink detected "
+                                 f"(+{cal_val - self.initial_load_right:.2f} g above initial)")
+                self._drink_flag_right = drink_now
+ 
+            # Flag 2: below-offset — weight dropped below the empty-bottle baseline
+            if self.offset_weight_right is not None:
+                below_now = cal_val < self.offset_weight_right
+                if below_now and not self._drink_flag_right:
+                    flags.append(f"Exp {self.exp_id} R: load below offset weight "
+                                 f"({cal_val:.2f} g < offset {self.offset_weight_right:.2f} g)")
+                self._below_flag_right = below_now
+ 
+        return flags
+ 
     def start(self, ts: int):
+        # Clear the event log and reset all per-run state for a fresh start.
+        """Implement start."""
         with self._lock:
             self._log.clear()
         self.start_ts = ts
@@ -543,13 +670,22 @@ class ExperimentModel:
         self._fs.clear()
         self._load_a_last = 0
         self._load_b_last = 0
+        # Reset load-cell baselines so they are re-captured from the first reading.
+        self.initial_load_left  = None
+        self.initial_load_right = None
+        # Reset load flag edge-trigger guards.
+        self._drink_flag_left   = False
+        self._drink_flag_right  = False
+        self._below_flag_left   = False
+        self._below_flag_right  = False
         self.add(0, _EXP_ONSET)
-
+ 
     def stop(self, ts: int):
+        """Stop the experiment and record the offset event."""
         if self.running:
             self.running = False
             self.add(self.elapsed(ts), _EXP_OFFSET)
-
+ 
     # ── Flag detection (Task 2b + 2c) ─────────────────────────────────────────
     def check_flags(self, now_ts: int, cfg: dict) -> List[str]:
         """
@@ -563,13 +699,13 @@ class ExperimentModel:
             now = self.elapsed(now_ts)
             log = self.get_log()
             flags: List[str] = []
-
+ 
             on_l  = [r.timestamp_ms for r in log if r.event_id == _L_ON]
             on_r  = [r.timestamp_ms for r in log if r.event_id == _R_ON]
             off_l = [r.timestamp_ms for r in log if r.event_id == _L_OFF]
             off_r = [r.timestamp_ms for r in log if r.event_id == _R_OFF]
             onsets = sorted(on_l + on_r)
-
+ 
             # ── 2b-i: no lick at all for longer than X minutes ────────────────
             nolick_ms = cfg["no_lick_minutes"] * 60_000
             last_lick = onsets[-1] if onsets else 0
@@ -578,7 +714,7 @@ class ExperimentModel:
                 flags.append(
                     f"longer than {cfg['no_lick_minutes']:g} minutes with no lick")
             self._fs["nolick"] = cond
-
+ 
             # ── 2b-ii: prolonged single continuous lick (> X seconds) ─────────
             plick_ms = cfg["prolonged_lick_seconds"] * 1000
             for side, ons, offs in (("L", on_l, off_l), ("R", on_r, off_r)):
@@ -590,7 +726,7 @@ class ExperimentModel:
                         f"prolonged lick longer than "
                         f"{cfg['prolonged_lick_seconds']:g} seconds ({side})")
                 self._fs[key] = c
-
+ 
             # ── 2b-iii: prolonged lick bout (> X minutes of ongoing licking) ──
             gap_ms  = cfg["bout_gap_seconds"] * 1000
             bout_ms = cfg["prolonged_bout_minutes"] * 60_000
@@ -611,10 +747,10 @@ class ExperimentModel:
                     f"prolonged lick bout longer than "
                     f"{cfg['prolonged_bout_minutes']:g} minutes")
             self._fs["bout"] = bout_cond
-
+ 
             # ── 2c: load-cell sanity checks, sampled on their own windows ─────
             tol = cfg["load_change_tolerance_g"]
-
+ 
             # 2c-i: licks but no change in load value
             a_ms = cfg["load_nochange_minutes"] * 60_000
             if now - self._load_a_last >= a_ms:
@@ -628,7 +764,7 @@ class ExperimentModel:
                             f"no change in load cell value after "
                             f"{cfg['load_nochange_minutes']:g} minutes of "
                             f"licking ({side})")
-
+ 
             # 2c-ii: load value changed but no licks
             b_ms = cfg["load_nolick_minutes"] * 60_000
             if now - self._load_b_last >= b_ms:
@@ -641,95 +777,189 @@ class ExperimentModel:
                         flags.append(
                             f"changes in load cell value despite no licks in "
                             f"past {cfg['load_nolick_minutes']:g} minutes ({side})")
-
+ 
             return flags
         except Exception as e:
             print(f"[watchdog] exp {self.exp_id}: {e}")
             return []
-
+ 
     @staticmethod
     def _load_range(log, load_eid, t0, t1) -> Optional[float]:
+        """Return the amplitude range (max-min) of load events in a time window, or None if fewer than 2 samples."""
         amps = [r.amplitude for r in log
                 if r.event_id == load_eid and t0 < r.timestamp_ms <= t1]
         if len(amps) < 2:
             return None
         return max(amps) - min(amps)
-
+ 
 # ══════════════════════════════════════════════════════════════════════════════
 # RASTER PANEL
 # ══════════════════════════════════════════════════════════════════════════════
-
+ 
+# Maximum number of rows shown at once in the raster viewport.
+# When total rows exceed this, the plot scrolls to show only the most recent
+# MAX_VISIBLE_ROWS rows; earlier rows are accessible by scrolling up.
+MAX_VISIBLE_ROWS = 4
+ 
+ 
 class RasterPanel:
     """
     Matplotlib raster embedded in a Tk widget for one experiment.
-
+ 
     Lick events → filled BLOCKS from onset to offset (no gaps between bins).
     Load cell   → translucent shaded area + line, superimposed on top.
-    Rows grow dynamically as recording extends past each minute.
-
-    Task 5: load traces now use FIXED, user-settable limits (load_ymin/ymax)
-    instead of per-row min/max, and dotted tick marks are drawn at load_yticks
-    levels with a gram scale labelled on the right margin.
+ 
+    Row ordering: row 0 (first minute) at the TOP; time flows downward.
+ 
+    Scroll behaviour (Change 3):
+      • The matplotlib figure is tall enough to hold ALL rows at a fixed
+        per-row height, embedded inside a Tk Canvas with a scrollbar.
+      • The visible viewport is always clamped to MAX_VISIBLE_ROWS rows.
+        When total rows ≤ MAX_VISIBLE_ROWS the figure simply fills the space.
+        When total rows > MAX_VISIBLE_ROWS the scrollbar appears and the view
+        auto-scrolls to show the MOST RECENT rows (bottom of the figure),
+        while earlier rows remain accessible by scrolling up.
+      • The per-row height (in inches) is fixed so that exactly
+        MAX_VISIBLE_ROWS rows fill the widget at all times.
+ 
+    Task 5: load traces use FIXED, user-settable limits (load_ymin/ymax)
+    instead of per-row min/max, and dotted tick marks are drawn at
+    load_yticks levels with a gram scale labelled on the right margin.
     """
-
+ 
+    # Fixed height of the host widget in pixels; one row = this / MAX_VISIBLE_ROWS.
+    _WIDGET_H_PX = 260
+ 
     def __init__(self, parent: tk.Widget, exp_id: int):
+        """
+        Build the scrollable raster panel inside `parent`.
+        A Tk Canvas + vertical Scrollbar wrap the matplotlib FigureCanvasTkAgg
+        so the figure can grow taller than the visible area.
+        """
         self.exp_id = exp_id
         # Task 5 axis config (overwritten from settings by MainWindow)
         self.load_ymin   = LOAD_YMIN
         self.load_ymax   = LOAD_YMAX
         self.load_yticks = LOAD_YTICKS
-
-        self._fig   = Figure(figsize=(6, 2.6), dpi=96, facecolor=BG_PNL)
-        self._ax    = self._fig.add_subplot(111)
-        self._fig.subplots_adjust(left=0.06, right=0.94, top=0.90, bottom=0.20)
-        self._canvas = FigureCanvasTkAgg(self._fig, master=parent)
-        self._canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+ 
+        # ── Scrollable container ──────────────────────────────────────────────
+        # outer_frame holds the Tk Canvas and the vertical scrollbar side-by-side.
+        outer = tk.Frame(parent, bg=BG_PNL)
+        outer.pack(fill=tk.BOTH, expand=True)
+ 
+        self._scroll_canvas = tk.Canvas(
+            outer, bg=BG_PNL, highlightthickness=0,
+            height=self._WIDGET_H_PX)
+        vsb = ttk.Scrollbar(outer, orient=tk.VERTICAL,
+                             command=self._scroll_canvas.yview)
+        self._scroll_canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+ 
+        # Inner frame hosts the matplotlib canvas; its height will be set
+        # dynamically in update() as rows are added.
+        self._inner = tk.Frame(self._scroll_canvas, bg=BG_PNL)
+        self._canvas_window = self._scroll_canvas.create_window(
+            (0, 0), window=self._inner, anchor="nw")
+        self._inner.bind(
+            "<Configure>",
+            lambda e: self._scroll_canvas.configure(
+                scrollregion=self._scroll_canvas.bbox("all")))
+        # Keep inner frame width in sync with the scroll canvas width.
+        self._scroll_canvas.bind(
+            "<Configure>",
+            lambda e: self._scroll_canvas.itemconfig(
+                self._canvas_window, width=e.width))
+ 
+        # ── Matplotlib figure ─────────────────────────────────────────────────
+        # Initial size = 1 row (fills the viewport); grows with data.
+        dpi = 96
+        row_h_in = self._WIDGET_H_PX / dpi / MAX_VISIBLE_ROWS
+        init_h   = row_h_in * 1          # start with 1 row height
+        w_in     = 6                      # width (Tk will stretch it via fill=BOTH)
+ 
+        self._dpi      = dpi
+        self._row_h_in = row_h_in        # height per row in inches (constant)
+ 
+        self._fig    = Figure(figsize=(w_in, init_h), dpi=dpi, facecolor=BG_PNL)
+        self._ax     = self._fig.add_subplot(111)
+        self._fig.subplots_adjust(left=0.06, right=0.94, top=0.96, bottom=0.18)
+ 
+        self._mpl_canvas = FigureCanvasTkAgg(self._fig, master=self._inner)
+        self._mpl_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+ 
         self._style_ax(self._ax, 1)
-        self._canvas.draw_idle()
-
+        self._mpl_canvas.draw_idle()
+ 
     def set_load_axis(self, ymin: float, ymax: float, yticks: int):
+        """Update the fixed load-cell axis limits (called from MainWindow settings)."""
         self.load_ymin   = ymin
         self.load_ymax   = ymax
         self.load_yticks = max(2, int(yticks))
-
+ 
     def update(self, events: List[EventRow]):
+        """
+        Redraw the full raster from the event list.
+ 
+        Figure height is resized to exactly n_rows × _row_h_in inches so every
+        row is the same physical height regardless of how many rows exist.
+ 
+        The matplotlib y-axis window (set_ylim) always shows at most
+        MAX_VISIBLE_ROWS rows, anchored to the MOST RECENT rows.  The Tk
+        scrollbar lets the user scroll up to inspect earlier rows.
+ 
+        After each redraw the Tk scroll canvas is moved to yview(1.0) so the
+        most recent rows are visible by default.
+        """
         ax = self._ax
         ax.cla()
-
+ 
         if not events:
+            self._resize_figure(1)
             self._style_ax(ax, 1)
             self._draw_load_ticks(ax, 1)
-            self._canvas.draw_idle()
+            self._mpl_canvas.draw_idle()
             return
-
+ 
         max_ms = max(e.timestamp_ms for e in events)
         n_rows = max(1, int(np.ceil(max_ms / (SECONDS_PER_ROW * 1000))))
+ 
+        # Resize the figure so all n_rows fit at a constant per-row height.
+        self._resize_figure(n_rows)
+ 
+        # _style_ax sets ylim to (n_rows, 0) — full extents, inverted.
+        # After drawing we narrow the ylim to show only the visible window.
         self._style_ax(ax, n_rows)
-
-        # Alternating row backgrounds
+ 
+        # Alternating row backgrounds (drawn over the full figure height)
         for r in range(n_rows):
             if r % 2 == 1:
                 ax.axhspan(r, r + 1, color=BG_ALT, zorder=0, linewidth=0)
-
+ 
         # Load-cell tick marks (Task 5) sit under the data
         self._draw_load_ticks(ax, n_rows)
-
+ 
         # ── Filled lick blocks ─────────────────────────────────────────────────
         for on_eid, off_eid, color in ((_L_ON, _L_OFF, CLR_L),
                                         (_R_ON, _R_OFF, CLR_R)):
             on_times  = sorted(e.timestamp_ms for e in events if e.event_id == on_eid)
             off_times = sorted(e.timestamp_ms for e in events if e.event_id == off_eid)
-
+ 
             off_pool = list(off_times)
             pairs: List[Tuple[int, int]] = []
             for on in on_times:
                 nxt = next((o for o in off_pool if o >= on), None)
                 if nxt is None:
-                    nxt = on + TIMEBIN_MS       # still touching → 1 bin minimum
+                    nxt = on + TIMEBIN_MS       # no offset yet — 1 bin minimum
                 else:
                     off_pool.remove(nxt)
+                # Enforce minimum 1-bin width unconditionally.
+                # Without this, licks where onset == offset (same Arduino tick)
+                # produce on_ms == off_ms, the while-loop never executes,
+                # and the lick is silently invisible in the raster.
+                nxt = max(nxt, on + TIMEBIN_MS)
                 pairs.append((on, nxt))
-
+ 
             for on_ms, off_ms in pairs:
                 t = on_ms
                 row_ms = SECONDS_PER_ROW * 1000
@@ -746,7 +976,7 @@ class RasterPanel:
                                      color=color, alpha=0.92,
                                      linewidth=0, zorder=3)
                     t = seg_end
-
+ 
         # ── Experiment onset / offset markers ──────────────────────────────────
         row_ms = SECONDS_PER_ROW * 1000
         for evt in events:
@@ -756,7 +986,7 @@ class RasterPanel:
             bin_x = (evt.timestamp_ms % row_ms) // TIMEBIN_MS
             ax.plot([bin_x, bin_x], [row, row + 0.95],
                     color=CLR_EXP, linewidth=1.8, zorder=5)
-
+ 
         # ── Load cell area plots (Task 5: fixed limits) ────────────────────────
         span = self.load_ymax - self.load_ymin
         if span > 0:
@@ -766,13 +996,13 @@ class RasterPanel:
                     continue
                 amps = np.array([e.amplitude for e in evts])
                 norm = np.clip((amps - self.load_ymin) / span, 0.0, 1.0)
-
+ 
                 by_row: Dict[int, List[Tuple[float, float]]] = {}
                 for e, n in zip(evts, norm):
                     r  = e.timestamp_ms // row_ms
                     bx = (e.timestamp_ms % row_ms) / TIMEBIN_MS
                     by_row.setdefault(r, []).append((bx, n))
-
+ 
                 for r, pts in by_row.items():
                     xs = np.array([p[0] for p in pts])
                     ys = np.array([p[1] for p in pts]) * 0.65 + r
@@ -780,9 +1010,26 @@ class RasterPanel:
                                     color=color, alpha=0.18, linewidth=0, zorder=2)
                     ax.plot(xs, ys, color=color, alpha=0.50,
                             linewidth=0.9, zorder=2)
-
-        self._canvas.draw_idle()
-
+ 
+        self._mpl_canvas.draw_idle()
+ 
+        # Auto-scroll the Tk scroll canvas to show the most recent (bottom) rows.
+        # Users can scroll up manually to see earlier rows.
+        self._scroll_canvas.after(50, lambda: self._scroll_canvas.yview_moveto(1.0))
+ 
+    def _resize_figure(self, n_rows: int):
+        """
+        Resize the matplotlib figure so all n_rows have equal height.
+        The figure width is left unchanged (Tk handles horizontal stretching).
+        The Tk inner frame is also explicitly sized so the scroll canvas
+        knows the full scrollable extent.
+        """
+        new_h_in = self._row_h_in * n_rows
+        self._fig.set_size_inches(self._fig.get_figwidth(), new_h_in)
+        # Update the Tk widget height to match (pixels = inches × dpi)
+        new_h_px = int(new_h_in * self._dpi)
+        self._mpl_canvas.get_tk_widget().config(height=new_h_px)
+ 
     def _draw_load_ticks(self, ax, n_rows: int):
         """Task 5: dotted reference lines + gram labels for the load scale."""
         span = self.load_ymax - self.load_ymin
@@ -804,29 +1051,42 @@ class RasterPanel:
                     fontsize=5, color=FG_MUT, va="center", ha="left")
         ax.text(BINS_PER_ROW * 1.01, 0.70, "g",
                 fontsize=5, color=FG_MUT, va="center", ha="left")
-
+ 
     def save_png(self, path: str):
+        """Save the full raster figure (all rows) to a PNG file."""
         self._fig.savefig(path, dpi=150, bbox_inches="tight",
                           facecolor=self._fig.get_facecolor())
-
+ 
     def _style_ax(self, ax, n_rows: int):
+        """
+        Style the raster axes for n_rows rows.
+ 
+        Y-axis is INVERTED so that row 0 (the first minute) sits at the TOP
+        and time flows downward — matching the natural reading direction of
+        left-to-right, top-to-bottom.  The visible window is clamped to the
+        most recent MAX_VISIBLE_ROWS rows; earlier rows are accessible by
+        scrolling up (handled in RasterPanel.update via ax.set_ylim).
+        """
         ax.set_facecolor(BG_PNL)
         for sp in ax.spines.values():
             sp.set_color(BG_ALT)
         ax.tick_params(colors=FG_MUT, labelsize=6)
-
+ 
         x_ticks  = np.arange(0, BINS_PER_ROW + 1, 10_000 // TIMEBIN_MS)
         x_labels = [str(int(t * TIMEBIN_MS / 1000)) for t in x_ticks]
         ax.set_xticks(x_ticks)
         ax.set_xticklabels(x_labels, fontsize=6, color=FG_MUT)
         ax.set_xlim(0, BINS_PER_ROW)
         ax.set_xlabel("s", fontsize=6, color=FG_MUT, labelpad=1)
-
-        ax.set_ylim(0, n_rows)
+ 
+        # Invert: ylim goes from n_rows (top) down to 0 (bottom of last row).
+        # Row index r occupies the band [r, r+1] in data coordinates, but
+        # because the axis is inverted, smaller y values appear lower on screen.
+        ax.set_ylim(n_rows, 0)   # top=n_rows, bottom=0  → row 0 at top
         ax.set_yticks(np.arange(n_rows) + 0.5)
         ax.set_yticklabels([f"m{r + 1}" for r in range(n_rows)],
                            fontsize=6, color=FG_MUT)
-
+ 
         ax.set_title(f"Exp {self.exp_id}", fontsize=8, color=FG,
                      pad=3, loc="left")
         ax.legend(
@@ -840,15 +1100,16 @@ class RasterPanel:
             loc="upper right", fontsize=5, framealpha=0.25,
             facecolor=BG_PNL, edgecolor=BG_ALT, labelcolor=FG,
         )
-
-
+ 
+ 
 # ══════════════════════════════════════════════════════════════════════════════
 # EXPERIMENT QUADRANT  (one of four panes in the main view)
 # ══════════════════════════════════════════════════════════════════════════════
-
+ 
 class ExpQuadrant(tk.Frame):
     def __init__(self, master, model: ExperimentModel,
                  reader: SerialReader, arduino_ts: list, host):
+        """Build the raster panel inside `parent` with a scrollable Tk Canvas wrapper."""
         super().__init__(master, bg=BG_PNL,
                          highlightbackground=BG_ALT, highlightthickness=1)
         self.model        = model
@@ -859,32 +1120,33 @@ class ExpQuadrant(tk.Frame):
         self._autosave_job = None
         self._shown       = 0
         self._build()
-
+ 
     def _build(self):
         # Top bar
+        """Assemble the top strip, notebook tabs, and alert banner."""
         top = tk.Frame(self, bg=BG_PNL, pady=3)
         top.pack(fill=tk.X, padx=4)
-
+ 
         tk.Label(top, text=f"Experiment {self.model.exp_id}",
                  font=FONTB, bg=BG_PNL, fg=FG).pack(side=tk.LEFT, padx=6)
-
+ 
         self._run_btn = tk.Button(
             top, text="▶ Run", font=FONTB,
             bg=CLR_GRN, fg="white", activebackground="#25A244",
             relief=tk.FLAT, padx=8, pady=2, command=self._run)
         self._run_btn.pack(side=tk.LEFT, padx=4)
-
+ 
         self._stop_btn = tk.Button(
             top, text="⏹ Stop & Save", font=FONTB,
             bg=CLR_RED, fg="white", activebackground="#CC3730",
             relief=tk.FLAT, padx=8, pady=2,
             state=tk.DISABLED, command=self._stop_and_save)
         self._stop_btn.pack(side=tk.LEFT, padx=4)
-
+ 
         self._status = tk.StringVar(value="Idle")
         tk.Label(top, textvariable=self._status,
                  font=FONT, bg=BG_PNL, fg=FG_MUT).pack(side=tk.LEFT, padx=10)
-
+ 
         # Raster plot
         plot_frame = tk.Frame(self, bg=BG_PNL)
         plot_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
@@ -893,12 +1155,12 @@ class ExpQuadrant(tk.Frame):
         pv = self._host.plot_settings()
         self._raster.set_load_axis(pv["load_ymin"], pv["load_ymax"],
                                    pv["load_yticks"])
-
+ 
         # Compact event log
         log_outer = tk.Frame(self, bg=BG_PNL, height=108)
         log_outer.pack(fill=tk.X, padx=2, pady=(0, 2))
         log_outer.pack_propagate(False)
-
+ 
         # Apply ttk style once globally
         s = ttk.Style()
         s.theme_use("default")
@@ -910,7 +1172,7 @@ class ExpQuadrant(tk.Frame):
                  dict(background=BG_PNL, foreground=FG_MUT, font=FONTB))):
             s.configure(widget, **cfg)
         s.map("Treeview", background=[("selected", BG_ALT)])
-
+ 
         cols = ("ts", "id", "event", "amp")
         self._tree = ttk.Treeview(log_outer, columns=cols,
                                    show="headings", height=5)
@@ -918,28 +1180,29 @@ class ExpQuadrant(tk.Frame):
                            ("event", 95, "Event"), ("amp", 60, "Amp")):
             self._tree.heading(c, text=lbl)
             self._tree.column(c, width=w, anchor=tk.CENTER)
-
+ 
         sb = ttk.Scrollbar(log_outer, orient=tk.VERTICAL,
                             command=self._tree.yview)
         self._tree.configure(yscrollcommand=sb.set)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self._tree.pack(fill=tk.BOTH, expand=True)
-
+ 
         self._tree.tag_configure("left",  foreground=CLR_L)
         self._tree.tag_configure("right", foreground=CLR_R)
         self._tree.tag_configure("exp",   foreground=CLR_EXP)
         self._tree.tag_configure("load",  foreground=FG_MUT)
-
+ 
     def apply_plot_settings(self):
         """Called by MainWindow when the Raster plot visuals tab changes."""
         pv = self._host.plot_settings()
         self._raster.set_load_axis(pv["load_ymin"], pv["load_ymax"],
                                    pv["load_yticks"])
         self._raster.update(self.model.get_log())
-
+ 
     # ── Controls ──────────────────────────────────────────────────────────────
-
+ 
     def _run(self):
+        """Start the experiment: clear the log, record onset, begin the refresh timer."""
         if not self.model.running:
             self.model.start(self._arduino_ts[0])
             self._run_btn.config(state=tk.DISABLED)
@@ -947,8 +1210,9 @@ class ExpQuadrant(tk.Frame):
             self._shown = 0
             self._schedule()
             self._schedule_autosave()        # Task 6
-
+ 
     def _stop_and_save(self):
+        """Stop the experiment, cancel timers, flush the final frame, and prompt to save .npy + .png."""
         if self.model.running:
             self.model.stop(self._arduino_ts[0])
         if self._refresh_job:
@@ -957,7 +1221,7 @@ class ExpQuadrant(tk.Frame):
             self.after_cancel(self._autosave_job)
             self._autosave_job = None
         self._refresh()  # final flush
-
+ 
         stem = f"exp{self.model.exp_id}_{datetime.datetime.now():%Y%m%d_%H%M%S}"
         # Task 6: default the dialog to the configured save folder.
         initdir = self._host.get_save_folder() or _HERE
@@ -973,18 +1237,20 @@ class ExpQuadrant(tk.Frame):
             self._raster.save_png(png)
             messagebox.showinfo("Saved",
                 f"Log  → {npy}\nPlot → {png}")
-
+ 
         self._run_btn.config(state=tk.NORMAL)
         self._stop_btn.config(state=tk.DISABLED)
         self._status.set("Stopped")
-
+ 
     # ── Autosave every AUTOSAVE_HOURS (Task 6) ────────────────────────────────
-
+ 
     def _schedule_autosave(self):
+        """Schedule the next autosave tick after AUTOSAVE_HOURS hours."""
         interval_ms = int(AUTOSAVE_HOURS * 3600 * 1000)
         self._autosave_job = self.after(interval_ms, self._autosave_tick)
-
+ 
     def _autosave_tick(self):
+        """Perform one autosave: write .npy + .png to the save folder, then reschedule."""
         if not self.model.running:
             return
         folder = self._host.get_save_folder()
@@ -1004,21 +1270,24 @@ class ExpQuadrant(tk.Frame):
                                   "autosave skipped — no save folder set",
                                   level="error")
         self._schedule_autosave()            # keep autosaving while running
-
+ 
     # ── Refresh ───────────────────────────────────────────────────────────────
-
+ 
     def _schedule(self):
+        """Schedule the next GUI refresh tick after GUI_REFRESH_MS milliseconds."""
         self._refresh_job = self.after(GUI_REFRESH_MS, self._tick)
-
+ 
     def _tick(self):
+        """One refresh cycle: update the display then reschedule if still running."""
         self._refresh()
         if self.model.running:
             self._schedule()
-
+ 
     def _refresh(self):
+        """Update the raster plot and append any new event log rows to the tree widget."""
         events = self.model.get_log()
         self._raster.update(events)
-
+ 
         for e in events[self._shown:]:
             name = _EVT_NAME.get(e.event_id, f"#{e.event_id}")
             tag  = _EVT_TAG.get(e.event_id, "")
@@ -1029,28 +1298,29 @@ class ExpQuadrant(tk.Frame):
         self._shown = len(events)
         if events:
             self._tree.yview_moveto(1.0)
-
+ 
         if self.model.running and self.model.start_ts is not None:
             el = (self._arduino_ts[0] - self.model.start_ts) / 1000
             self._status.set(f"● {el:.0f} s")
-
-
+ 
+ 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN WINDOW
 # ══════════════════════════════════════════════════════════════════════════════
-
+ 
 class MainWindow(tk.Tk):
     def __init__(self, initial_port: Optional[str] = None):
+        """Read persisted settings, build the full GUI, and start the flag watchdog."""
         super().__init__()
-
+ 
         # Task 3: load persisted settings first so everything populates from them.
         self._settings = load_settings()
         port = initial_port or self._settings["shared"].get("port") or SERIAL_PORT
-
+ 
         self.title(f"Lickometer  ·  Columbia AIC  ·  {port}")
         self.configure(bg=BG)
         self.geometry("1440x980")
-
+ 
         self._reader     = SerialReader()
         self._reader.port = port
         self._models     = {i: ExperimentModel(i) for i in range(1, 5)}
@@ -1060,21 +1330,22 @@ class MainWindow(tk.Tk):
         self._last_raw:  Dict[int, float] = {}   # {arduino_id: last_amp}
         self._snaps:     Dict[tuple, float] = {} # {(load_id, "50g"|"bottle"): val}
         self._quadrants: List[ExpQuadrant] = []
-
+ 
         # Apply persisted calibration to the models before the GUI builds.
         self._apply_loaded_calibration(port)
-
+ 
         self._build(port)
         self._refresh_loaded_into_gui()          # Task 3: populate GUI fields
-
+ 
         # Task 2: start the flag watchdog (runs in the Tk main loop).
         self.after(WATCHDOG_MS, self._watchdog_tick)
-
+ 
     # ══════════════════════════════════════════════════════════════════════════
     # SETTINGS HELPERS (Task 3)
     # ══════════════════════════════════════════════════════════════════════════
-
+ 
     def _apply_loaded_calibration(self, port: str):
+        """Apply persisted calibration ratios (from settings JSON) to the experiment models before the GUI opens."""
         psec = self._settings.get("ports", {}).get(port, {})
         cal  = psec.get("calibration", {})
         for exp_str, c in cal.items():
@@ -1087,7 +1358,7 @@ class MainWindow(tk.Tk):
                 continue
             m.cal_left  = float(c.get("cal_left",  1.0))
             m.cal_right = float(c.get("cal_right", 1.0))
-
+ 
     def flag_settings(self) -> dict:
         """Current flag thresholds as floats (read from GUI vars if built)."""
         if hasattr(self, "_flag_vars"):
@@ -1099,8 +1370,9 @@ class MainWindow(tk.Tk):
                     out[k] = self._settings["shared"]["flags"][k]
             return out
         return dict(self._settings["shared"]["flags"])
-
+ 
     def plot_settings(self) -> dict:
+        """Return current load-cell axis settings as a dict (reads live GUI vars if available)."""
         if hasattr(self, "_plot_vars"):
             out = {}
             for k, v in self._plot_vars.items():
@@ -1111,22 +1383,24 @@ class MainWindow(tk.Tk):
             out["load_yticks"] = int(out["load_yticks"])
             return out
         return dict(self._settings["shared"]["plot"])
-
+ 
     def get_save_folder(self) -> str:
+        """Return the currently configured save folder path (from the GUI var if built)."""
         if hasattr(self, "_folder_var"):
             return self._folder_var.get().strip()
         return self._settings["shared"].get("save_folder", "")
-
+ 
     # ══════════════════════════════════════════════════════════════════════════
     # LAYOUT
     # ══════════════════════════════════════════════════════════════════════════
-
+ 
     def _build(self, port: str):
         # Top strip
+        """Assemble the top strip, notebook tabs, and alert banner."""
         top_strip = tk.Frame(self, bg=BG_PNL, pady=5)
         top_strip.pack(fill=tk.X)
         self._build_top_strip(top_strip, port)
-
+ 
         # Notebook
         s = ttk.Style()
         s.configure("TNotebook",     background=BG,     borderwidth=0)
@@ -1135,24 +1409,24 @@ class MainWindow(tk.Tk):
         s.map("TNotebook.Tab",
               background=[("selected", BG_ALT)],
               foreground=[("selected", FG)])
-
+ 
         nb = ttk.Notebook(self)
         nb.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
-
+ 
         exp_tab   = tk.Frame(nb, bg=BG);  nb.add(exp_tab,   text="  Experiments  ")
         cal_tab   = tk.Frame(nb, bg=BG);  nb.add(cal_tab,   text="  Calibration  ")
         flag_tab  = tk.Frame(nb, bg=BG);  nb.add(flag_tab,  text="  Flag Settings  ")
         vis_tab   = tk.Frame(nb, bg=BG);  nb.add(vis_tab,   text="  Raster Plot Visuals  ")
         data_tab  = tk.Frame(nb, bg=BG);  nb.add(data_tab,  text="  Data  ")
         term_tab  = tk.Frame(nb, bg=BG);  nb.add(term_tab,  text="  Terminal  ")
-
+ 
         self._build_quad_tab(exp_tab)
         self._build_cal_tab(cal_tab)
         self._build_flag_tab(flag_tab)
         self._build_visuals_tab(vis_tab)
         self._build_data_tab(data_tab)
         self._build_terminal_tab(term_tab)
-
+ 
         # Persistent alert banner at the very bottom (Task 2 visibility)
         banner = tk.Frame(self, bg=BG_PNL)
         banner.pack(fill=tk.X, side=tk.BOTTOM)
@@ -1161,36 +1435,39 @@ class MainWindow(tk.Tk):
         self._alert_banner = tk.Label(banner, text="—", font=FONTM,
                                       bg=BG_PNL, fg=FG_MUT, anchor="w")
         self._alert_banner.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=3)
-
+ 
     # ── Top strip ─────────────────────────────────────────────────────────────
-
+ 
     def _build_top_strip(self, parent, port: str):
+        """Build the connection, interval, and stream-control row at the top of the window."""
         def lbl(text):
+            """Create a plain label widget with standard styling."""
             return tk.Label(parent, text=text, font=FONT, bg=BG_PNL, fg=FG)
-
+ 
         def btn(text, cmd, bg=BG_ALT, fg=FG, **kw):
+            """Create a button widget with standard styling."""
             return tk.Button(parent, text=text, command=cmd,
                              font=FONTB, bg=bg, fg=fg,
                              activebackground=BG, relief=tk.FLAT,
                              padx=10, pady=3, **kw)
-
+ 
         lbl("Port:").pack(side=tk.LEFT, padx=(12, 4))
         self._port_var = tk.StringVar(value=port)
         tk.Entry(parent, textvariable=self._port_var, width=14,
                  font=FONTM, bg=BG_ALT, fg=FG,
                  insertbackground=FG, relief=tk.FLAT
                  ).pack(side=tk.LEFT, padx=4)
-
+ 
         self._conn_btn = btn("Connect", self._toggle_connect)
         self._conn_btn.pack(side=tk.LEFT, padx=6)
-
+ 
         self._conn_lbl = tk.Label(parent, text="⚫ Disconnected",
                                    font=FONT, bg=BG_PNL, fg=FG_MUT)
         self._conn_lbl.pack(side=tk.LEFT, padx=10)
-
+ 
         tk.Frame(parent, bg=FG_MUT, width=1, height=22
                  ).pack(side=tk.LEFT, padx=12, fill=tk.Y)
-
+ 
         lbl("Weight report interval (s):").pack(side=tk.LEFT, padx=(0, 4))
         self._interval_var = tk.StringVar(
             value=str(self._settings["shared"].get("weight_interval", 30)))
@@ -1200,39 +1477,41 @@ class MainWindow(tk.Tk):
                    buttonbackground=BG_ALT, relief=tk.FLAT
                    ).pack(side=tk.LEFT, padx=4)
         btn("Set", self._send_interval).pack(side=tk.LEFT, padx=4)
-
+ 
         tk.Frame(parent, bg=FG_MUT, width=1, height=22
                  ).pack(side=tk.LEFT, padx=12, fill=tk.Y)
-
+ 
         self._stream_btn = tk.Button(
             parent, text="▶ Start Arduino stream", font=FONTB,
             bg=CLR_GRN, fg="white", activebackground="#25A244",
             relief=tk.FLAT, padx=10, pady=3,
             state=tk.DISABLED, command=self._toggle_stream)
         self._stream_btn.pack(side=tk.LEFT, padx=6)
-
+ 
         self._ts_lbl = tk.Label(parent, text="ts: —",
                                  font=FONTM, bg=BG_PNL, fg=FG_MUT)
         self._ts_lbl.pack(side=tk.RIGHT, padx=16)
-
+ 
     # ── Tab: Experiments (4 quadrants) ────────────────────────────────────────
-
+ 
     def _build_quad_tab(self, parent):
+        """Build the 2×2 grid of ExpQuadrant widgets for the Experiments tab."""
         parent.columnconfigure(0, weight=1)
         parent.columnconfigure(1, weight=1)
         parent.rowconfigure(0, weight=1)
         parent.rowconfigure(1, weight=1)
-
+ 
         positions = {1: (0, 0), 2: (0, 1), 3: (1, 0), 4: (1, 1)}
         for exp_id, (row, col) in positions.items():
             q = ExpQuadrant(parent, self._models[exp_id],
                             self._reader, self._arduino_ts, host=self)
             q.grid(row=row, column=col, sticky="nsew", padx=3, pady=3)
             self._quadrants.append(q)
-
+ 
     # ── Tab: Calibration ──────────────────────────────────────────────────────
-
+ 
     def _build_cal_tab(self, parent):
+        """Build the Calibration tab: hardware commands, touch thresholds, and load-cell snap UI."""
         sc = tk.Canvas(parent, bg=BG, highlightthickness=0)
         vsb = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=sc.yview)
         sc.configure(yscrollcommand=vsb.set)
@@ -1242,8 +1521,9 @@ class MainWindow(tk.Tk):
         sc.create_window((0, 0), window=body, anchor="nw")
         body.bind("<Configure>",
                   lambda e: sc.configure(scrollregion=sc.bbox("all")))
-
+ 
         def section(title, subtitle=""):
+            """Create a labelled section card (title + optional subtitle + inner frame)."""
             tk.Label(body, text=title, font=FONTB, bg=BG, fg=FG
                      ).pack(anchor="w", padx=16, pady=(16, 1))
             if subtitle:
@@ -1252,26 +1532,27 @@ class MainWindow(tk.Tk):
             f = tk.Frame(body, bg=BG_PNL, padx=14, pady=10)
             f.pack(fill=tk.X, padx=16, pady=(0, 4))
             return f
-
+ 
         # ── Hardware calibration ──────────────────────────────────────────────
         hw = section("Hardware calibration",
                      "Sends commands directly to the Arduino.")
-
+ 
         def hw_row(r, label, btn_text, cmd_fn):
+            """Add one hardware-calibration row (label + button) to the calibration grid."""
             tk.Label(hw, text=label, font=FONT, bg=BG_PNL, fg=FG
                      ).grid(row=r, column=0, sticky="w", pady=5, padx=(0, 16))
             tk.Button(hw, text=btn_text, font=FONTB,
                       bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=8,
                       command=cmd_fn
                       ).grid(row=r, column=1, sticky="w", padx=4)
-
+ 
         hw_row(0, "Offset calibration — all channels, bottles must be empty:",
                "Send 'o'", lambda: self._reader.send("o"))
         hw_row(1, "Gain calibration — all channels, 50g on each bottle:",
                "Send 'cg' (all)", lambda: self._reader.send("cg"))
         hw_row(3, "Touch sensor calibration:",
                "Send 't'", lambda: self._reader.send("t"))
-
+ 
         tk.Label(hw, text="Gain calibration — single channel (0-7):",
                  font=FONT, bg=BG_PNL, fg=FG
                  ).grid(row=2, column=0, sticky="w", pady=5, padx=(0, 16))
@@ -1283,7 +1564,7 @@ class MainWindow(tk.Tk):
                   bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=8,
                   command=lambda: self._reader.send(f"k{self._gcal_ch.get()}g")
                   ).grid(row=2, column=2, sticky="w", padx=4)
-
+ 
         # ── Touch thresholds ──────────────────────────────────────────────────
         th = section("Touch sensitivity thresholds",
                      "Per channel (0-7). Range 20-255, default 130. "
@@ -1304,7 +1585,7 @@ class MainWindow(tk.Tk):
                       bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=6,
                       command=lambda ch=ch: self._set_threshold(ch)
                       ).grid(row=r, column=c * 3 + 2, padx=4)
-
+ 
         # ── Software load-cell calibration ────────────────────────────────────
         lc = section("Load cell software calibration",
                      "1. Place 50g reference on bottle → Snap 50g.\n"
@@ -1313,12 +1594,12 @@ class MainWindow(tk.Tk):
                      "Saved per-port and restored on next launch.")
         grid = tk.Frame(lc, bg=BG_PNL)
         grid.pack(fill=tk.X)
-
+ 
         for col, hd in enumerate(["Exp", "Side", "Arduino ID",
                                    "50g raw", "", "Bottle raw", "", "Ratio"]):
             tk.Label(grid, text=hd, font=FONTB, bg=BG_PNL, fg=FG_MUT
                      ).grid(row=0, column=col, padx=6, pady=3, sticky="w")
-
+ 
         self._snap_svars: Dict[tuple, tk.StringVar] = {}
         cal_loaded = (self._settings.get("ports", {})
                       .get(self._reader.port, {}).get("calibration", {}))
@@ -1334,7 +1615,7 @@ class MainWindow(tk.Tk):
                              bg=BG_PNL,
                              fg=FG_MUT if col == 2 else FG
                              ).grid(row=r, column=col, padx=6)
-
+ 
                 # restore snapped raw values + ratio if present
                 csec  = cal_loaded.get(str(exp_id), {})
                 side_l = side.lower()
@@ -1354,7 +1635,7 @@ class MainWindow(tk.Tk):
                               command=lambda k=key, sk=snap_key, lid=load_id:
                                       self._snap(k, sk, lid)
                               ).grid(row=r, column=4 + ci * 2, padx=2)
-
+ 
                 ratio_init = csec.get(f"cal_{side_l}")
                 sv_r = tk.StringVar(
                     value=f"{ratio_init:.5f}" if ratio_init else "—")
@@ -1363,23 +1644,24 @@ class MainWindow(tk.Tk):
                          bg=BG_PNL, fg=CLR_GRN
                          ).grid(row=r, column=7, padx=8)
                 r += 1
-
+ 
     # ── Tab: Flag Settings (Task 2b/2c) ───────────────────────────────────────
-
+ 
     def _build_flag_tab(self, parent):
+        """Build the Flag Settings tab where watchdog thresholds can be adjusted."""
         intro = ("All thresholds are live: editing a value and clicking "
                  "Apply & Save updates the running watchdog and writes the "
                  "value to lickometer_settings.json (shared across instances).")
         tk.Label(parent, text=intro, font=FONT, bg=BG, fg=FG_MUT,
                  wraplength=900, justify="left"
                  ).pack(anchor="w", padx=16, pady=(12, 6))
-
+ 
         f = tk.Frame(parent, bg=BG_PNL, padx=16, pady=12)
         f.pack(fill=tk.X, padx=16, pady=(0, 8))
-
+ 
         self._flag_vars: Dict[str, tk.StringVar] = {}
         flags = self._settings["shared"]["flags"]
-
+ 
         rows = [
             ("no_lick_minutes",         "No lick at all for longer than (min):"),
             ("prolonged_bout_minutes",  "Prolonged lick bout longer than (min):"),
@@ -1398,13 +1680,13 @@ class MainWindow(tk.Tk):
                        textvariable=v, width=10, font=FONTM,
                        bg=BG_ALT, fg=FG, relief=tk.FLAT
                        ).grid(row=i, column=1, sticky="w", padx=4)
-
+ 
         tk.Button(f, text="Apply & Save", font=FONTB,
                   bg=CLR_GRN, fg="white", activebackground="#25A244",
                   relief=tk.FLAT, padx=10, pady=3,
                   command=self._apply_flag_settings
                   ).grid(row=len(rows), column=0, sticky="w", pady=(10, 0))
-
+ 
         # ── Alerts log ────────────────────────────────────────────────────────
         tk.Label(parent, text="Alerts log", font=FONTB, bg=BG, fg=FG
                  ).pack(anchor="w", padx=16, pady=(6, 2))
@@ -1419,20 +1701,21 @@ class MainWindow(tk.Tk):
         self._alert_text.tag_configure("error", foreground=CLR_RED)
         self._alert_text.tag_configure("flag",  foreground=CLR_EXP)
         self._alert_text.tag_configure("info",  foreground=FG_MUT)
-
+ 
     # ── Tab: Raster Plot Visuals (Task 5) ─────────────────────────────────────
-
+ 
     def _build_visuals_tab(self, parent):
+        """Build the Raster Plot Visuals tab for load-cell axis limits."""
         tk.Label(parent,
                  text="Load-cell axis limits and tick marks for the raster "
                       "plots. Applies to all four experiments and is saved "
                       "(shared across instances).",
                  font=FONT, bg=BG, fg=FG_MUT, wraplength=900, justify="left"
                  ).pack(anchor="w", padx=16, pady=(12, 6))
-
+ 
         f = tk.Frame(parent, bg=BG_PNL, padx=16, pady=12)
         f.pack(fill=tk.X, padx=16, pady=(0, 8))
-
+ 
         self._plot_vars: Dict[str, tk.StringVar] = {}
         plot = self._settings["shared"]["plot"]
         rows = [
@@ -1449,16 +1732,17 @@ class MainWindow(tk.Tk):
                        textvariable=v, width=10, font=FONTM,
                        bg=BG_ALT, fg=FG, relief=tk.FLAT
                        ).grid(row=i, column=1, sticky="w", padx=4)
-
+ 
         tk.Button(f, text="Apply & Save", font=FONTB,
                   bg=CLR_GRN, fg="white", activebackground="#25A244",
                   relief=tk.FLAT, padx=10, pady=3,
                   command=self._apply_plot_settings
                   ).grid(row=len(rows), column=0, sticky="w", pady=(10, 0))
-
+ 
     # ── Tab: Data / Save folder (Task 6) ──────────────────────────────────────
-
+ 
     def _build_data_tab(self, parent):
+        """Build the Data tab: save folder picker and autosave configuration."""
         tk.Label(parent,
                  text="Choose the folder that Stop & Save defaults to and that "
                       f"autosave writes to every {AUTOSAVE_HOURS} hours while an "
@@ -1466,10 +1750,10 @@ class MainWindow(tk.Tk):
                       "(shared across instances).",
                  font=FONT, bg=BG, fg=FG_MUT, wraplength=900, justify="left"
                  ).pack(anchor="w", padx=16, pady=(12, 6))
-
+ 
         f = tk.Frame(parent, bg=BG_PNL, padx=16, pady=12)
         f.pack(fill=tk.X, padx=16, pady=(0, 8))
-
+ 
         tk.Label(f, text="Save folder:", font=FONT, bg=BG_PNL, fg=FG
                  ).grid(row=0, column=0, sticky="w", padx=(0, 8))
         self._folder_var = tk.StringVar(
@@ -1487,16 +1771,17 @@ class MainWindow(tk.Tk):
                   relief=tk.FLAT, padx=10,
                   command=self._save_folder_path
                   ).grid(row=0, column=3, padx=4)
-
+ 
     # ── Tab: Terminal ─────────────────────────────────────────────────────────
-
+ 
     def _build_terminal_tab(self, parent):
+        """Build the Terminal tab: raw serial text output and manual command entry."""
         tk.Label(parent,
                  text="Raw serial terminal — all Arduino output, errors and "
                       "flags appear here. You can also type commands directly.",
                  font=FONT, bg=BG, fg=FG_MUT
                  ).pack(anchor="w", padx=12, pady=6)
-
+ 
         self._term_text = tk.Text(parent, bg=BG_PNL, fg=FG,
                                    font=FONTM, relief=tk.FLAT,
                                    state=tk.DISABLED, wrap=tk.NONE)
@@ -1509,7 +1794,7 @@ class MainWindow(tk.Tk):
         tsb_v.pack(side=tk.RIGHT, fill=tk.Y)
         tsb_h.pack(side=tk.BOTTOM, fill=tk.X)
         self._term_text.pack(fill=tk.BOTH, expand=True, padx=6)
-
+ 
         cmd_row = tk.Frame(parent, bg=BG, pady=4)
         cmd_row.pack(fill=tk.X, padx=6)
         tk.Label(cmd_row, text="Send:", font=FONT, bg=BG, fg=FG
@@ -1528,48 +1813,50 @@ class MainWindow(tk.Tk):
                   bg=BG_ALT, fg=FG_MUT, relief=tk.FLAT, padx=8,
                   command=self._clear_terminal
                   ).pack(side=tk.LEFT, padx=4)
-
+ 
         self.after(300, self._poll_terminal)
-
+ 
     # ══════════════════════════════════════════════════════════════════════════
     # POPULATE GUI FROM LOADED SETTINGS (Task 3)
     # ══════════════════════════════════════════════════════════════════════════
-
+ 
     def _refresh_loaded_into_gui(self):
         # apply loaded plot settings to each raster
+        """Populate all GUI widgets from the settings loaded at startup (Task 3 round-trip)."""
         for q in self._quadrants:
             q.apply_plot_settings()
-
+ 
     # ══════════════════════════════════════════════════════════════════════════
     # ALERTS  (Task 2)
     # ══════════════════════════════════════════════════════════════════════════
-
+ 
     def emit_alert(self, exp_id, text: str, level: str = "flag"):
         """Show an alert in the GUI (alerts log + bottom banner) and terminal."""
         stamp = datetime.datetime.now().strftime("%H:%M:%S")
         who   = "SYSTEM" if exp_id in (None, 0) else f"Exp {exp_id}"
         tag   = "ERROR" if level == "error" else ("INFO" if level == "info" else "FLAG")
         line  = f"[{stamp}] [{who}] {tag}: {text}"
-
+ 
         # terminal
         self._reader._push_raw(line)
         print(line)
-
+ 
         # alerts log
         if hasattr(self, "_alert_text"):
             self._alert_text.config(state=tk.NORMAL)
             self._alert_text.insert(tk.END, line + "\n", (level,))
             self._alert_text.see(tk.END)
             self._alert_text.config(state=tk.DISABLED)
-
+ 
         # bottom banner
         if hasattr(self, "_alert_banner"):
             colour = CLR_RED if level == "error" else (
                 FG_MUT if level == "info" else CLR_EXP)
             self._alert_banner.config(text=line, fg=colour)
-
+ 
     def _watchdog_tick(self):
         # Task 2: never let watchdog errors stop the loop.
+        """Periodic watchdog: call check_flags() on every running experiment and emit any new alerts."""
         try:
             if self._connected and self._streaming:
                 now = self._arduino_ts[0]
@@ -1581,12 +1868,13 @@ class MainWindow(tk.Tk):
             print(f"[watchdog] {e}")
         finally:
             self.after(WATCHDOG_MS, self._watchdog_tick)
-
+ 
     # ══════════════════════════════════════════════════════════════════════════
     # ACTIONS
     # ══════════════════════════════════════════════════════════════════════════
-
+ 
     def _toggle_connect(self):
+        """Connect to or disconnect from the Arduino serial port."""
         if not self._connected:
             self._reader.port = self._port_var.get().strip()
             self.title(f"Lickometer  ·  Columbia AIC  ·  {self._reader.port}")
@@ -1612,8 +1900,9 @@ class MainWindow(tk.Tk):
             self._conn_btn.config(text="Connect")
             self._conn_lbl.config(text="⚫ Disconnected", fg=FG_MUT)
             self._stream_btn.config(state=tk.DISABLED)
-
+ 
     def _send_interval(self):
+        """Validate and send the weight-report interval command to the Arduino."""
         try:
             n = int(self._interval_var.get())
             if not 10 <= n <= 99999:
@@ -1623,8 +1912,9 @@ class MainWindow(tk.Tk):
             return
         self._reader.send(f"i{n}")
         save_shared_value("weight_interval", n)          # Task 3
-
+ 
     def _toggle_stream(self):
+        """Start or stop the Arduino event stream ('r' / 's' commands)."""
         if not self._streaming:
             self._reader.send("r")
             self._streaming = True
@@ -1635,8 +1925,9 @@ class MainWindow(tk.Tk):
             self._streaming = False
             self._stream_btn.config(text="▶ Start Arduino stream",
                                      bg=CLR_GRN, activebackground="#25A244")
-
+ 
     def _set_threshold(self, ch: int):
+        """Validate and send the touch threshold for channel ch to the Arduino, then persist it."""
         try:
             n = int(self._thresh_vars[ch].get())
             if not 20 <= n <= 255:
@@ -1649,8 +1940,9 @@ class MainWindow(tk.Tk):
         self.after(200, lambda: self._reader.send(str(n)))
         # Task 3: persist per-port threshold
         save_port_section(self._reader.port, "thresholds", {str(ch): n})
-
+ 
     def _snap(self, key: tuple, snap_key: str, load_id: int):
+        """Record a load-cell snap reading (50g or bottle), compute the calibration ratio, and persist it."""
         raw = self._last_raw.get(load_id)
         if raw is None:
             messagebox.showwarning("No data",
@@ -1660,19 +1952,32 @@ class MainWindow(tk.Tk):
         self._snaps[(load_id, snap_key)] = raw
         exp_id, side = key
         self._snap_svars[(exp_id, side, snap_key)].set(f"{raw:.1f}")
-
+ 
         v50  = self._snaps.get((load_id, "50g"))
         vbot = self._snaps.get((load_id, "bottle"))
         ratio = None
+        m = self._models[exp_id]
+ 
+        # When the bottle snap is recorded, store the raw value as the
+        # offset_weight baseline for the below-offset load flag (Flag 2).
+        # The offset is stored in raw ADC units; it will be multiplied by the
+        # calibration ratio once that is computed below.
+        if snap_key == "bottle":
+            # Store as raw for now; recomputed after ratio is known.
+            self._snaps[(load_id, "bottle_raw")] = raw
+ 
         if v50 is not None and vbot is not None and vbot != 0:
             ratio = v50 / vbot
             self._snap_svars[(exp_id, side, "ratio")].set(f"{ratio:.5f}")
-            m = self._models[exp_id]
             if side == "Left":
                 m.cal_left  = ratio
+                # Calibrated offset weight = raw bottle reading × ratio
+                m.offset_weight_left  = vbot * ratio
             else:
                 m.cal_right = ratio
-
+                # Calibrated offset weight = raw bottle reading × ratio
+                m.offset_weight_right = vbot * ratio
+ 
         # Task 3: persist calibration (raw snaps + ratio) per-port, per-exp.
         side_l = side.lower()
         data = load_settings()
@@ -1684,9 +1989,10 @@ class MainWindow(tk.Tk):
         if ratio is not None:
             csec[f"cal_{side_l}"] = ratio
         _write_settings(data)
-
+ 
     def _apply_flag_settings(self):
         # validate
+        """Validate and save the flag threshold values entered in the Flag Settings tab."""
         vals = {}
         for k, v in self._flag_vars.items():
             try:
@@ -1698,8 +2004,9 @@ class MainWindow(tk.Tk):
         # reload into our cached settings so flag_settings() stays consistent
         self._settings["shared"]["flags"].update(vals)
         self.emit_alert(None, "flag thresholds updated", level="info")
-
+ 
     def _apply_plot_settings(self):
+        """Validate and apply load-cell axis limits from the Raster Plot Visuals tab."""
         vals = {}
         for k, v in self._plot_vars.items():
             try:
@@ -1716,41 +2023,47 @@ class MainWindow(tk.Tk):
         for q in self._quadrants:                        # Task 5: live redraw
             q.apply_plot_settings()
         self.emit_alert(None, "raster plot visuals updated", level="info")
-
+ 
     def _browse_folder(self):
+        """Open a folder-chooser dialog and store the selected save folder."""
         folder = filedialog.askdirectory(
             title="Choose save folder",
             initialdir=self._folder_var.get().strip() or _HERE)
         if folder:
             self._folder_var.set(folder)
             self._save_folder_path()
-
+ 
     def _save_folder_path(self):
+        """Persist the currently entered save folder path to settings."""
         folder = self._folder_var.get().strip()
         save_shared_value("save_folder", folder)         # Task 3
         self._settings["shared"]["save_folder"] = folder
         self.emit_alert(None, f"save folder set: {folder}", level="info")
-
+ 
     def _send_raw_cmd(self):
+        """Send the raw command typed in the Terminal tab entry box to the Arduino."""
         cmd = self._cmd_var.get().strip()
         if cmd:
             self._reader.send(cmd)
             self._cmd_var.set("")
-
+ 
     def _clear_terminal(self):
+        """Clear all text from the Terminal tab text widget."""
         self._term_text.config(state=tk.NORMAL)
         self._term_text.delete("1.0", tk.END)
         self._term_text.config(state=tk.DISABLED)
-
+ 
     # ══════════════════════════════════════════════════════════════════════════
     # BACKGROUND DISPATCH
     # ══════════════════════════════════════════════════════════════════════════
-
+ 
     def _start_dispatch(self):
+        """Start the background dispatch thread and the timestamp label polling loop."""
         threading.Thread(target=self._dispatch_loop, daemon=True).start()
         self.after(500, self._poll_ts_label)
-
+ 
     def _dispatch_loop(self):
+        """Background thread: pull events from the serial queue, update arduino_ts, and route to models."""
         while self._connected:
             try:
                 msg = self._reader.queue.get(timeout=0.2)
@@ -1763,14 +2076,23 @@ class MainWindow(tk.Tk):
             self._last_raw[aid] = amp
             for model in self._models.values():
                 if model.owns(aid):
-                    model.ingest(ts, aid, amp)
-
+                    # ingest() returns a list of flag strings for load-cell events;
+                    # forward each one to the alert banner immediately.
+                    new_flags = model.ingest(ts, aid, amp)
+                    for flag_msg in (new_flags or []):
+                        # emit_alert must be called on the Tk main thread;
+                        # schedule it safely with after(0, ...).
+                        self.after(0, lambda msg=flag_msg, eid=model.exp_id:
+                                   self.emit_alert(eid, msg, level="warning"))
+ 
     def _poll_ts_label(self):
+        """Update the timestamp label in the top strip every 500 ms."""
         self._ts_lbl.config(text=f"ts: {self._arduino_ts[0]}")
         if self._connected:
             self.after(500, self._poll_ts_label)
-
+ 
     def _poll_terminal(self):
+        """Drain the raw_queue and append new lines to the Terminal tab text widget."""
         lines = []
         try:
             while True:
@@ -1787,8 +2109,8 @@ class MainWindow(tk.Tk):
                 self._term_text.delete("1.0", f"{n - 1500}.0")
             self._term_text.config(state=tk.DISABLED)
         self.after(200, self._poll_terminal)
-
-
+ 
+ 
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     # Task 1: optional COM port from the command line pre-fills the Port box,
