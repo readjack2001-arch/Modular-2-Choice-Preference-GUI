@@ -2248,6 +2248,15 @@ class MainWindow(tk.Tk):
         self._last_raw:  Dict[int, float] = {}   # {arduino_id: last_amp}
         self._cal_buf:   Dict[int, list]  = {}   # {load_id: [(ts_ms, grams), ...]} live feed
         self._snaps:     Dict[tuple, float] = {} # {(load_id, "50g"|"bottle"): val}
+        # The Arduino now streams load cells continuously (≈ LOADCELL_PERIOD_MS).
+        # The "weight interval" is applied HERE, in Python: during the experiment
+        # each load channel is recorded into its model only once per interval, so
+        # the experiment log is downsampled even though the raw feed is fast. The
+        # calibration monitor + stability gate use the FULL-rate feed (_cal_buf),
+        # untouched by this throttle, so they always see the most recent values.
+        self._weight_interval_s: float = float(
+            self._settings["shared"].get("weight_interval", 30))
+        self._last_load_ingest: Dict[int, float] = {}   # {load_id: last ingest ts_ms}
         self._quadrants: List[ExpQuadrant] = []
         self._fullviews: Dict[int, FullViewPanel] = {}   # exp_id → full-view tab
         self._central_job = None
@@ -2574,6 +2583,10 @@ class MainWindow(tk.Tk):
 
     def note_run_state_changed(self):
         """An experiment started/stopped — refresh full-views so they aren't stale."""
+        # A run just started/stopped: clear the per-channel load throttle so the
+        # next streamed load reading is recorded immediately (captures the run's
+        # initial_load baseline without waiting up to a full interval).
+        self._last_load_ingest.clear()
         for exp_id, fv in getattr(self, "_fullviews", {}).items():
             try:
                 fv.update_view(self._models[exp_id].get_log())
@@ -2683,6 +2696,10 @@ class MainWindow(tk.Tk):
         data_tab  = tk.Frame(nb, bg=BG);  nb.add(data_tab,  text="  Data  ")
         term_tab  = tk.Frame(nb, bg=BG);  nb.add(term_tab,  text="  Terminal  ")
 
+        # Keep refs so the calibration tab can be identified by tab focus.
+        self._nb = nb
+        self._cal_tab = cal_tab
+
         self._build_cal_tab(cal_tab)
         self._build_flag_tab(flag_tab)
         self._build_flags_reported_tab(freport_tab)   # Task F4
@@ -2731,7 +2748,7 @@ class MainWindow(tk.Tk):
         tk.Frame(parent, bg=FG_MUT, width=1, height=22
                  ).pack(side=tk.LEFT, padx=12, fill=tk.Y)
 
-        lbl("Weight report interval (s):").pack(side=tk.LEFT, padx=(0, 4))
+        lbl("Weight sampling interval (s):").pack(side=tk.LEFT, padx=(0, 4))
         self._interval_var = tk.StringVar(
             value=str(self._settings["shared"].get("weight_interval", 30)))
         tk.Spinbox(parent, from_=10, to=99999,
@@ -2862,10 +2879,16 @@ class MainWindow(tk.Tk):
                        ).pack(side=tk.LEFT, padx=(0, 14))
         self._cal_delay_var   = tk.StringVar(value="5")
         self._cal_thresh_var  = tk.StringVar(value="0.1")
-        self._cal_varthresh_var = tk.StringVar(value="0.0025")
+        self._cal_varthresh_var = tk.StringVar(value="0.1")
         self._cal_present_var = tk.StringVar(value="0.5")
-        param("Stability delay (s):",       self._cal_delay_var,    0.5, 600, 0.5)
+        # Stability is judged over the last N load-cell READINGS, not seconds:
+        # the load feed is fast and continuous but round-robins 8 channels, so a
+        # given cell refreshes every ~8·LOADCELL_PERIOD_MS. Counting readings
+        # keeps the gate aligned with the monitor at whatever the cell rate is.
+        self._cal_nsamp_var   = tk.StringVar(value="3")
+        param("Stability window (samples):", self._cal_nsamp_var,   2, 50,  1)
         param("Variance thresh (g²):",      self._cal_varthresh_var, 0.0, 50, 0.0005)
+        param("Monitor span (s):",          self._cal_delay_var,    0.5, 600, 0.5)
         param("Gram-spread thresh (g):",    self._cal_thresh_var,   0.001, 50, 0.01)
         param("Weight-present min (g):",    self._cal_present_var,  0, 100, 0.1)
         self._weight_present_var = tk.StringVar(value="1")
@@ -3593,7 +3616,11 @@ class MainWindow(tk.Tk):
             self._stream_btn.config(state=tk.DISABLED)
 
     def _send_interval(self):
-        """Validate and send the weight-report interval command to the Arduino."""
+        """Set the weight-sampling interval. The fast firmware streams load cells
+        continuously (rate fixed by LOADCELL_PERIOD_MS in the sketch), so this no
+        longer changes the Arduino's rate — it sets how often the experiment
+        RECORDS a load value per channel (Python-side downsample). Calibration is
+        unaffected and always uses the full-rate feed."""
         try:
             n = int(self._interval_var.get())
             if not 10 <= n <= 99999:
@@ -3601,7 +3628,8 @@ class MainWindow(tk.Tk):
         except ValueError:
             messagebox.showerror("Bad interval", "Must be 10–99999 seconds.")
             return
-        self._reader.send(f"i{n}")
+        self._weight_interval_s = float(n)               # live: throttle uses it now
+        self._reader.send(f"i{n}")                        # legacy ack; firmware ignores
         save_shared_value("weight_interval", n)          # Task 3
 
     def _toggle_stream(self):
@@ -3618,6 +3646,17 @@ class MainWindow(tk.Tk):
             self._stream_btn.config(text="▶ Start Arduino stream",
                                      bg=CLR_GRN, activebackground="#25A244")
             self._cancel_init_lockout()          # Task S1
+
+    def _on_cal_tab(self) -> bool:
+        """True when the Calibration tab is the one currently shown."""
+        nb = getattr(self, "_nb", None)
+        cal = getattr(self, "_cal_tab", None)
+        if nb is None or cal is None:
+            return False
+        try:
+            return nb.select() == str(cal)
+        except Exception:
+            return False
 
     # ── Task S1 / C3: reactive post-stream initialisation ────────────────────
     def _begin_init_lockout(self):
@@ -3642,12 +3681,12 @@ class MainWindow(tk.Tk):
         self._init_msg_job = self.after(INIT_STEP_MS, self._show_next_init_msg)
 
     def _init_cell_settled(self, load_id: int) -> bool:
-        """A load cell counts as settled once it has ≥2 readings and its last few
-        readings pass the selected stability metric (works at any stream rate)."""
-        buf = self._cal_buf.get(int(load_id), [])
-        if len(buf) < 2:
-            return False
-        return self._metric_ok([v for (_, v) in buf[-4:]])
+        """Initialization for a cell is 'done' as soon as load-cell DATA is
+        arriving for it (≥2 readings). We deliberately do NOT require the
+        stability metric here: initialization confirms the stream is live, not
+        that the weights have settled. Per-cell settling for calibration is
+        judged separately by the snap-stability gate (_cell_stable)."""
+        return len(self._cal_buf.get(int(load_id), [])) >= 2
 
     def _check_init_stable(self):
         """Poll until every active load cell has settled (or the safety cap)."""
@@ -3664,15 +3703,15 @@ class MainWindow(tk.Tk):
         self._init_check_job = self.after(500, self._check_init_stable)
 
     def _end_init_lockout(self, timed_out: bool = False):
-        """Re-enable run + calibration once load values have stabilised."""
+        """Re-enable run + calibration once the load stream is live."""
         self._init_stable = True
         self._set_controls_locked(False)
         self._init_lbl.config(text=INIT_MSGS[-1])   # leave 'ready to lick'
         if timed_out:
-            self.emit_alert(None, "initialization proceeded without stable load "
-                                  "values (safety timeout)", level="warning")
+            self.emit_alert(None, "initialization proceeded without load-cell "
+                                  "data (safety timeout)", level="warning")
         else:
-            self.emit_alert(None, "initialization complete — load values stable",
+            self.emit_alert(None, "initialization complete — load stream live",
                             level="info")
 
     def _cancel_init_lockout(self):
@@ -3737,7 +3776,17 @@ class MainWindow(tk.Tk):
         try:
             return max(1e-9, float(self._cal_varthresh_var.get()))
         except (AttributeError, ValueError, tk.TclError):
-            return 0.0025
+            return 0.1
+
+    def _cal_nsamp(self) -> int:
+        """Number of most-recent load-cell readings the stability gate (and the
+        monitor's variance trace) are computed over. Count-based, because load
+        cells report only every weight_interval seconds, so a seconds-based
+        window holds too few samples to be meaningful."""
+        try:
+            return max(2, int(float(self._cal_nsamp_var.get())))
+        except (AttributeError, ValueError, tk.TclError):
+            return 4
 
     def _metric_ok(self, vals) -> bool:
         """Whether a set of readings is 'stable' under the selected metric."""
@@ -3751,18 +3800,16 @@ class MainWindow(tk.Tk):
         return var <= self._cal_var_thresh()
 
     def _cell_stable(self, load_id: int) -> bool:
-        """True when the cell's recent readings pass the selected stability metric
-        (variance by default, or gram spread). Uses the readings inside the delay
-        window, falling back to the last few readings when sampling is sparse so
-        the gate tracks the variance shown on the monitor at any stream rate."""
-        delay, _, _ = self._cal_params()
+        """True when the cell's last N readings pass the selected stability metric
+        (variance by default, or gram spread). N = the 'Stability window
+        (samples)' control. This is computed over exactly the same N readings the
+        monitor's rightmost variance point uses, so what you SEE on the monitor is
+        what GATES the snap button — they can no longer disagree."""
+        n   = self._cal_nsamp()
         buf = self._cal_buf.get(int(load_id), [])
-        if len(buf) < 3:
+        if len(buf) < n:
             return False
-        now = buf[-1][0]
-        recent = [(t, v) for (t, v) in buf if t >= now - delay * 1000.0]
-        if len(recent) < 3:
-            recent = buf[-3:]          # sparse sampling: judge the last few reads
+        recent = buf[-n:]
         return self._metric_ok([v for (_, v) in recent])
 
     @staticmethod
@@ -3781,12 +3828,36 @@ class MainWindow(tk.Tk):
                 out.append(0.0)
         return out
 
+    @staticmethod
+    def _moving_variance_n(ys, n):
+        """Trailing moving variance of ys over the last n SAMPLES at each point.
+        The rightmost value equals the variance over the last n readings, which
+        is exactly what _cell_stable gates on — so the monitor and the gate match
+        regardless of how slowly the load cells report."""
+        out = []
+        for i in range(len(ys)):
+            seg = ys[max(0, i - n + 1):i + 1]
+            if len(seg) >= 2:
+                mean = sum(seg) / len(seg)
+                out.append(sum((v - mean) ** 2 for v in seg) / len(seg))
+            else:
+                out.append(0.0)
+        return out
+
     def _draw_cal_feed(self, delay):
         """Redraw each load cell's own monitor: shared x-axis (time), individual
-        y-axis. Mode toggle shows raw/reported grams or the moving variance."""
-        now = self._arduino_ts[0]
+        y-axis. Mode toggle shows raw/reported grams or the moving variance.
+
+        The plotted window and the variance are SAMPLE-count based (last M reads),
+        so at the slow load-cell report rate the trace is still visible and its
+        rightmost variance point equals what the snap gate uses."""
+        now  = self._arduino_ts[0]
+        n    = self._cal_nsamp()
+        # Show a generous tail so the n-sample variance has context: at least the
+        # last ~3·n readings, and never fewer than 8. Also bound by a time span so
+        # very long sessions don't redraw the whole history.
+        m_show = max(8, 3 * n)
         win_ms = max(30.0, delay * 5.0) * 1000.0
-        var_win_ms = max(2.0, delay) * 1000.0
         mode = (self._cal_disp_var.get()
                 if hasattr(self, "_cal_disp_var") else "raw")
         cells = self._cal_cells
@@ -3801,13 +3872,15 @@ class MainWindow(tk.Tk):
             ax.tick_params(colors=FG_MUT, labelsize=6)
             color = CLR_L if side == "Left" else CLR_R
             buf = self._cal_buf.get(load_id, [])
-            pts = [(t, v) for (t, v) in buf if t >= now - win_ms]
+            # Last m_show readings, additionally trimmed to win_ms of history.
+            pts = buf[-m_show:]
+            pts = [(t, v) for (t, v) in pts if t >= now - win_ms] or buf[-m_show:]
             if pts:
                 tms = [t for (t, _) in pts]
                 xs  = [(t - now) / 1000.0 for t in tms]
                 raw = [v for (_, v) in pts]
                 if mode == "var":
-                    ys = self._moving_variance(tms, raw, var_win_ms)
+                    ys = self._moving_variance_n(raw, n)
                     yl = "var(g²)"
                 else:
                     ys = raw
@@ -3846,7 +3919,13 @@ class MainWindow(tk.Tk):
             stage  = "offset" if load_id not in self._offset_done else "gain"
             key    = (load_id, stage)
             if stable:
-                self._snap_armed.add(key)      # latch: arm once, stays armed
+                # Latch ONLY the current stage. After the offset snap the gain
+                # stage starts un-armed, so the cell must re-stabilise (with the
+                # 50 g now on it) before the 50 g snap unlocks — the same
+                # stability algorithm runs again for gain. Within a stage the
+                # latch is one-way: a momentary wobble after arming won't disarm;
+                # only taking the snap clears it.
+                self._snap_armed.add(key)
             armed = key in self._snap_armed
 
             off_b  = self._snap_btns.get((exp_id, side, "offset"))
@@ -3980,7 +4059,9 @@ class MainWindow(tk.Tk):
             m = self._models[exp_id]
             if side == "Left":  m.offset_weight_left  = live
             else:               m.offset_weight_right = live
-            # Offset done → the GAIN stage must re-stabilise (with the 50 g on).
+            # Offset done → advance to the gain stage and clear BOTH arms so the
+            # cell must re-stabilise with the 50 g on it before the gain snap
+            # unlocks (same stability algorithm runs again).
             self._snap_armed.discard((load_id, "offset"))
             self._snap_armed.discard((load_id, "gain"))
         else:
@@ -4034,7 +4115,7 @@ class MainWindow(tk.Tk):
                 if side == "Left":  m.offset_weight_left  = live
                 else:               m.offset_weight_right = live
                 self._snap_armed.discard((lid, "offset"))
-                self._snap_armed.discard((lid, "gain"))
+                self._snap_armed.discard((lid, "gain"))   # gain must re-stabilise
             else:
                 self._snap_armed.discard((lid, "gain"))
             self._snap_svars[(exp_id, side, kind)].set(
@@ -4238,11 +4319,23 @@ class MainWindow(tk.Tk):
             self._last_raw[aid] = amp
             # C2: keep a bounded rolling buffer of load readings for the
             # calibration live feed + stability detection (ids 0-7 are loads).
-            if 0 <= aid <= 7:
+            # This is the FULL-rate feed — never throttled — so calibration sees
+            # every value the Arduino sends.
+            is_load = 0 <= aid <= 7
+            if is_load:
                 buf = self._cal_buf.setdefault(aid, [])
                 buf.append((ts, amp))
                 if len(buf) > 600:
                     del buf[:len(buf) - 600]
+                # Experiment throttle: record this load channel into its model at
+                # most once per weight-interval. Lick events (ids ≥ 8) are never
+                # throttled — they must stay real-time. The Arduino streams load
+                # continuously now; downsampling for the experiment happens here.
+                interval_ms = max(0.0, self._weight_interval_s * 1000.0)
+                last = self._last_load_ingest.get(aid)
+                if last is not None and (ts - last) < interval_ms:
+                    continue                      # skip model ingest this tick
+                self._last_load_ingest[aid] = ts
             for model in self._models.values():
                 if model.owns(aid):
                     # ingest() returns a list of flag strings for load-cell events;
