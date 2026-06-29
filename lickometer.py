@@ -118,7 +118,7 @@ WATCHDOG_MS = 2000
 # END USER CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-import sys, threading, queue, time, re, datetime, os, json, builtins
+import sys, threading, queue, time, re, datetime, os, json, builtins, math
 from typing import List, Optional, Dict, Tuple
 from dataclasses import dataclass
 
@@ -606,8 +606,8 @@ def _open_onset(ons: List[int], offs: List[int]) -> Optional[int]:
 class EventRow:
     timestamp_ms: int
     event_id:     int
-    amplitude:    float          # calibrated value (load weight in g for load events)
-    raw:          float = 0.0     # EL23: raw pre-calibration amplitude
+    amplitude:    float          # load weight in grams (Arduino is source of truth)
+    consumption:  float = float("nan")   # baseline − current weight (g); NaN for non-load
 
 
 class ExperimentModel:
@@ -637,6 +637,19 @@ class ExperimentModel:
         self.initial_load_right:  Optional[float] = None  # first R load reading this run
         self.offset_weight_left:  Optional[float] = None  # empty-bottle weight, left side
         self.offset_weight_right: Optional[float] = None  # empty-bottle weight, right side
+        # C2: empty-CELL stable baseline (no bottle) — reference for drift (C5).
+        self.baseline_weight_left:  Optional[float] = None
+        self.baseline_weight_right: Optional[float] = None
+
+        # ── C5: load-cell DRIFT correction (estimated from no-lick windows) ──
+        # During quiet periods (no licks) the weight should be flat; any linear
+        # trend is treated as drift, accumulated, and subtracted from readings.
+        self.drift_enabled:      bool  = False
+        self.drift_min_window_s: float = 60.0   # min quiet time before trusting a slope
+        self.drift_min_points:   int   = 4      # min readings before fitting a slope
+        self._drift_committed = {"L": 0.0, "R": 0.0}   # accumulated drift removed (g)
+        self._drift_win       = {"L": None, "R": None} # current no-lick regression sums
+        self._last_lick_ts:   Optional[int] = None
 
         # Threshold above initial weight that counts as a "drink detected" flag (g)
         self.DRINK_DELTA_G: float = 0.5
@@ -668,16 +681,16 @@ class ExperimentModel:
         return max(0, ts - self.start_ts) if self.start_ts is not None else 0
 
     def add(self, ts_ms: int, eid: int, amp: float = 0.0,
-            raw: Optional[float] = None):
+            consumption: Optional[float] = None):
         """Append one EventRow to the thread-safe event log.
 
-        `raw` (EL23) is the pre-calibration amplitude; for load events the caller
-        passes the raw reading while `amp` holds the calibrated weight. When not
-        given it defaults to `amp` (lick/onset events have no separate raw value).
+        `consumption` (g) is baseline − current weight for load events; for
+        non-load events it stays NaN.
         """
         with self._lock:
             self._log.append(EventRow(ts_ms, eid, amp,
-                                      amp if raw is None else raw))
+                                      float("nan") if consumption is None
+                                      else consumption))
 
     def get_log(self) -> List[EventRow]:
         """Return a snapshot copy of the event log (thread-safe)."""
@@ -685,24 +698,25 @@ class ExperimentModel:
             return list(self._log)
 
     def export_npy(self, path: str):
-        """Save the event log as a structured NumPy .npy file (EL22/EL23).
+        """Save the event log as a structured NumPy .npy file.
 
-        Fields: timestamp_ms, event_id, amplitude (calibrated weight for load
-        events) and raw_amplitude (the pre-calibration reading).
+        Fields: timestamp_ms, event_id, weight_g (load weight in grams; for lick
+        events this holds the 1/0 marker) and consumption_g (baseline − current
+        weight for load events, NaN otherwise).
         """
         log = self.get_log()
         if not log:
             return
         arr = np.array(
-            [(r.timestamp_ms, r.event_id, r.amplitude, r.raw) for r in log],
+            [(r.timestamp_ms, r.event_id, r.amplitude, r.consumption) for r in log],
             dtype=[("timestamp_ms",  np.int64),
                    ("event_id",      np.int8),
-                   ("amplitude",     np.float32),
-                   ("raw_amplitude", np.float32)])
+                   ("weight_g",      np.float32),
+                   ("consumption_g", np.float32)])
         np.save(path, arr)
 
     def export_csv(self, path: str):
-        """Save the event log as a .csv with raw + calibrated columns (EL22/EL23)."""
+        """Save the event log as a .csv: weight_g + consumption_g (no ratio)."""
         log = self.get_log()
         if not log:
             return
@@ -710,16 +724,78 @@ class ExperimentModel:
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["timestamp_ms", "event_id", "event_name",
-                        "raw_amplitude", "calibrated_amplitude"])
+                        "weight_g", "consumption_g"])
             for r in log:
+                cons = "" if math.isnan(r.consumption) else f"{r.consumption:.4f}"
                 w.writerow([r.timestamp_ms, r.event_id,
                             _EVT_NAME.get(r.event_id, str(r.event_id)),
-                            f"{r.raw:.4f}", f"{r.amplitude:.4f}"])
+                            f"{r.amplitude:.4f}", cons])
 
     def export_log(self, stem: str):
         """Write both .npy and .csv for the event log (EL22). `stem` has no extension."""
         self.export_npy(stem + ".npy")
         self.export_csv(stem + ".csv")
+
+    def set_drift_params(self, enabled: bool, min_window_s: float,
+                         min_points: int):
+        """Configure drift correction (called from the GUI)."""
+        self.drift_enabled      = bool(enabled)
+        self.drift_min_window_s = max(1.0, float(min_window_s))
+        self.drift_min_points   = max(2, int(min_points))
+
+    def _drift_reset(self):
+        """Clear all drift state (new run)."""
+        self._drift_committed = {"L": 0.0, "R": 0.0}
+        self._drift_win       = {"L": None, "R": None}
+        self._last_lick_ts    = None
+
+    def _drift_on_lick(self, ts: int):
+        """A lick ends the current no-lick window: commit its estimated drift
+        (if the window was long/dense enough) and reset, for BOTH sides."""
+        self._last_lick_ts = ts
+        for side in ("L", "R"):
+            w = self._drift_win[side]
+            if w and w.get("trust"):
+                self._drift_committed[side] += w["slope"] * w["elapsed_last"]
+            self._drift_win[side] = None
+
+    def _drift_correct(self, side: str, ts: int, raw: float) -> float:
+        """Return the drift-corrected weight for one load reading and update the
+        running no-lick regression for that side. Online least-squares fit of
+        weight vs seconds; the trend is treated as drift and subtracted."""
+        if not self.drift_enabled:
+            return raw
+        w = self._drift_win[side]
+        if w is None:
+            w = self._drift_win[side] = {"n": 0, "st": 0.0, "sw": 0.0,
+                                         "stt": 0.0, "stw": 0.0, "t0": ts,
+                                         "slope": 0.0, "elapsed_last": 0.0,
+                                         "trust": False}
+        t = (ts - w["t0"]) / 1000.0          # seconds since window start
+        w["n"]   += 1
+        w["st"]  += t
+        w["sw"]  += raw
+        w["stt"] += t * t
+        w["stw"] += t * raw
+        w["elapsed_last"] = t
+        slope = 0.0
+        if w["n"] >= self.drift_min_points:
+            denom = w["n"] * w["stt"] - w["st"] ** 2
+            if denom != 0:
+                slope = (w["n"] * w["stw"] - w["st"] * w["sw"]) / denom
+        w["slope"] = slope
+        w["trust"] = (w["n"] >= self.drift_min_points
+                      and t >= self.drift_min_window_s)
+        running = slope * t if w["trust"] else 0.0
+        return raw - self._drift_committed[side] - running
+
+    def drift_offset(self, side: str) -> float:
+        """Total drift currently being removed for a side (committed + running)."""
+        c = self._drift_committed.get(side, 0.0)
+        w = self._drift_win.get(side)
+        if w and w.get("trust"):
+            c += w["slope"] * w["elapsed_last"]
+        return c
 
     def ingest(self, ts: int, aid: int, amp: float):
         """
@@ -742,22 +818,27 @@ class ExperimentModel:
         flags: List[str] = []
 
         # ── Touch events ─────────────────────────────────────────────────────
-        if   aid == self.l_on_id:  self.add(el, _L_ON,  1.0); return flags
+        if   aid == self.l_on_id:
+            self._drift_on_lick(ts); self.add(el, _L_ON,  1.0); return flags
         elif aid == self.l_off_id: self.add(el, _L_OFF, 1.0); return flags
-        elif aid == self.r_on_id:  self.add(el, _R_ON,  1.0); return flags
+        elif aid == self.r_on_id:
+            self._drift_on_lick(ts); self.add(el, _R_ON,  1.0); return flags
         elif aid == self.r_off_id: self.add(el, _R_OFF, 1.0); return flags
 
         # ── Load cell events ──────────────────────────────────────────────────
         elif aid == self.l_load_id:
             if not self.capture_load:        # Task V1: skip capture entirely
                 return flags
-            cal_val = amp * self.cal_left   # apply software calibration ratio
+            # Arduino streams true grams; C5 subtracts estimated drift.
+            cal_val = self._drift_correct("L", ts, amp)
 
             # Capture the very first reading as the initial baseline.
             if self.initial_load_left is None:
                 self.initial_load_left = cal_val
 
-            self.add(el, _L_LOAD, cal_val, raw=amp)
+            # Consumption = baseline (initial full reading) − current weight.
+            cons = self.initial_load_left - cal_val
+            self.add(el, _L_LOAD, cal_val, consumption=cons)
 
             # Flag 1: drink detected — weight rose more than DRINK_DELTA_G above initial
             if self.initial_load_left is not None:
@@ -789,13 +870,16 @@ class ExperimentModel:
         elif aid == self.r_load_id:
             if not self.capture_load:        # Task V1: skip capture entirely
                 return flags
-            cal_val = amp * self.cal_right  # apply software calibration ratio
+            # Arduino streams true grams; C5 subtracts estimated drift.
+            cal_val = self._drift_correct("R", ts, amp)
 
             # Capture the very first reading as the initial baseline.
             if self.initial_load_right is None:
                 self.initial_load_right = cal_val
 
-            self.add(el, _R_LOAD, cal_val, raw=amp)
+            # Consumption = baseline (initial full reading) − current weight.
+            cons = self.initial_load_right - cal_val
+            self.add(el, _R_LOAD, cal_val, consumption=cons)
 
             # Flag 1: drink detected — weight rose more than DRINK_DELTA_G above initial
             if self.initial_load_right is not None:
@@ -844,6 +928,7 @@ class ExperimentModel:
         self._drink_flag_right  = False
         self._below_flag_left   = False
         self._below_flag_right  = False
+        self._drift_reset()                  # C5: clear drift estimate for new run
         self.add(0, _EXP_ONSET)
 
     def stop(self, ts: int):
@@ -1419,7 +1504,7 @@ class ExpQuadrant(tk.Frame):
                                    show="headings", height=5)
         for c, w, lbl in (("ts", 66, "min"), ("id", 32, "ID"),
                            ("event", 88, "Event"),
-                           ("raw", 60, "Raw"), ("amp", 64, "Weight(g)")):
+                           ("raw", 74, "Consum(g)"), ("amp", 64, "Weight(g)")):
             self._tree.heading(c, text=lbl)
             self._tree.column(c, width=w, anchor=tk.CENTER)
 
@@ -1534,7 +1619,8 @@ class ExpQuadrant(tk.Frame):
             name = _EVT_NAME.get(e.event_id, f"#{e.event_id}")
             tag  = _EVT_TAG.get(e.event_id, "")
             is_load = e.event_id in (_L_LOAD, _R_LOAD)
-            raw_str = f"{e.raw:.1f}" if is_load else ""   # EL23: raw amplitude
+            raw_str = ("" if (not is_load or math.isnan(e.consumption))
+                       else f"{e.consumption:.1f}")   # consumption (g)
             amp_str = f"{e.amplitude:.2f}" if is_load else f"{e.amplitude:.1f}"
             iid = self._tree.insert(
                 "", tk.END,
@@ -1957,6 +2043,10 @@ INIT_MSGS = [
 ]
 INIT_LOCKOUT_MS = 9000
 INIT_STEP_MS    = 1500
+# C3: initialization is now reactive — it waits for the load values to settle
+# rather than a fixed time. This is only a safety cap so a noisy/disconnected
+# cell can never lock the GUI forever.
+INIT_MAX_MS     = 180000
 
 class MainWindow(tk.Tk):
     def __init__(self, initial_port: Optional[str] = None,
@@ -2042,6 +2132,7 @@ class MainWindow(tk.Tk):
         self._connected  = False
         self._streaming  = False
         self._last_raw:  Dict[int, float] = {}   # {arduino_id: last_amp}
+        self._cal_buf:   Dict[int, list]  = {}   # {load_id: [(ts_ms, grams), ...]} live feed
         self._snaps:     Dict[tuple, float] = {} # {(load_id, "50g"|"bottle"): val}
         self._quadrants: List[ExpQuadrant] = []
         self._fullviews: Dict[int, FullViewPanel] = {}   # exp_id → full-view tab
@@ -2231,7 +2322,8 @@ class MainWindow(tk.Tk):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _apply_loaded_calibration(self, port: str):
-        """Apply persisted calibration ratios (from settings JSON) to the experiment models before the GUI opens."""
+        """Restore persisted empty-bottle offset weights into the models before
+        the GUI builds. (No software ratio anymore — Arduino owns grams.)"""
         psec = self._settings.get("ports", {}).get(port, {})
         cal  = psec.get("calibration", {})
         for exp_str, c in cal.items():
@@ -2242,8 +2334,11 @@ class MainWindow(tk.Tk):
             m = self._models.get(exp_id)
             if not m:
                 continue
-            m.cal_left  = float(c.get("cal_left",  1.0))
-            m.cal_right = float(c.get("cal_right", 1.0))
+            m.cal_left = m.cal_right = 1.0
+            if "offset_weight_left" in c:
+                m.offset_weight_left = float(c["offset_weight_left"])
+            if "offset_weight_right" in c:
+                m.offset_weight_right = float(c["offset_weight_right"])
 
     def flag_settings(self) -> dict:
         """Current flag thresholds as floats (read from GUI vars if built)."""
@@ -2591,39 +2686,178 @@ class MainWindow(tk.Tk):
             f.pack(fill=tk.X, padx=16, pady=(0, 4))
             return f
 
-        # ── Hardware calibration ──────────────────────────────────────────────
-        hw = section("Hardware calibration",
-                     "Sends commands directly to the Arduino.")
+        # ── Calibration controls (snap = tell the Arduino to calibrate) ───────
+        ctl = section(
+            "Load-cell calibration",
+            "Three stages, each requires a STABLE reading first:\n"
+            "  1. Empty cells (nothing on them) → Snap baseline  (reference only)\n"
+            "  2. Empty bottles on the cells     → Snap Bottle  (Arduino OFFSET cal)\n"
+            "  3. 50 g weights on the cells      → Snap 50 g    (Arduino GAIN cal)\n"
+            "Snaps unlock only once the live feed has settled. Gain is locked "
+            "until that cell's offset is done.")
 
-        def hw_row(r, label, btn_text, cmd_fn):
-            """Add one hardware-calibration row (label + button) to the calibration grid."""
-            tk.Label(hw, text=label, font=FONT, bg=BG_PNL, fg=FG
-                     ).grid(row=r, column=0, sticky="w", pady=5, padx=(0, 16))
-            b = tk.Button(hw, text=btn_text, font=FONTB,
-                          bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=8,
-                          command=cmd_fn)
-            b.grid(row=r, column=1, sticky="w", padx=4)
-            self._cal_lock_buttons.append(b)
+        self._offset_done: set = set()
+        self._snap_btns: Dict[tuple, object] = {}
+        self._cal_cells: list = []
+        self._cal_present_g = 0.5
 
-        hw_row(0, "Offset calibration — all channels, bottles must be empty:",
-               "Send 'o'", lambda: self._reader.send("o"))
-        hw_row(1, "Gain calibration — all channels, 50g on each bottle:",
-               "Send 'cg' (all)", lambda: self._reader.send("cg"))
-        hw_row(3, "Touch sensor calibration:",
-               "Send 't'", lambda: self._reader.send("t"))
+        # Stability + presence parameters (user-editable).
+        pf = tk.Frame(ctl, bg=BG_PNL); pf.pack(fill=tk.X, pady=(0, 8))
+        def param(label, var, frm, to, inc):
+            tk.Label(pf, text=label, font=FONT, bg=BG_PNL, fg=FG
+                     ).pack(side=tk.LEFT, padx=(0, 3))
+            tk.Spinbox(pf, from_=frm, to=to, increment=inc, textvariable=var,
+                       width=6, font=FONTM, bg=BG_ALT, fg=FG, relief=tk.FLAT
+                       ).pack(side=tk.LEFT, padx=(0, 14))
+        self._cal_delay_var   = tk.StringVar(value="5")
+        self._cal_thresh_var  = tk.StringVar(value="0.1")
+        self._cal_present_var = tk.StringVar(value="0.5")
+        param("Stability delay (s):",      self._cal_delay_var,   0.5, 600, 0.5)
+        param("Stability threshold (g):",  self._cal_thresh_var,  0.001, 50, 0.01)
+        param("Weight-present min (g):",    self._cal_present_var, 0, 100, 0.1)
+        self._weight_present_var = tk.StringVar(value="1")
+        tk.Checkbutton(
+            pf, variable=self._weight_present_var, onvalue="1", offvalue="0",
+            text="require weight present", font=FONT, bg=BG_PNL, fg=FG,
+            selectcolor=BG_ALT, activebackground=BG_PNL, activeforeground=FG
+            ).pack(side=tk.LEFT)
 
-        tk.Label(hw, text="Gain calibration — single channel (0-7):",
-                 font=FONT, bg=BG_PNL, fg=FG
-                 ).grid(row=2, column=0, sticky="w", pady=5, padx=(0, 16))
-        self._gcal_ch = tk.StringVar(value="0")
-        tk.Spinbox(hw, from_=0, to=7, textvariable=self._gcal_ch,
-                   width=4, font=FONTM, bg=BG_ALT, fg=FG, relief=tk.FLAT
-                   ).grid(row=2, column=1, sticky="w", padx=4)
-        kgb = tk.Button(hw, text="Send 'kg'", font=FONTB,
+        # C4: gain-cal averaging window (sent to the Arduino as 'wNNNNN' ms).
+        avgf = tk.Frame(ctl, bg=BG_PNL); avgf.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(avgf, text="Gain averaging window (s):", font=FONT,
+                 bg=BG_PNL, fg=FG).pack(side=tk.LEFT, padx=(0, 3))
+        init_ms = int(self._settings["shared"].get("gain_avg_ms", 2000))
+        self._gain_avg_var = tk.StringVar(value=f"{init_ms/1000:g}")
+        tk.Spinbox(avgf, from_=0.1, to=60, increment=0.5,
+                   textvariable=self._gain_avg_var, width=6, font=FONTM,
+                   bg=BG_ALT, fg=FG, relief=tk.FLAT).pack(side=tk.LEFT, padx=(0, 6))
+        gset = tk.Button(avgf, text="Set on Arduino", font=FONTB, bg=BG_ALT,
+                         fg=FG, relief=tk.FLAT, padx=8, command=self._set_gain_avg)
+        gset.pack(side=tk.LEFT)
+        self._cal_lock_buttons.append(gset)
+        tk.Label(avgf, text="(gain reads the 50 g voltage for this long and "
+                            "averages it, so a single jump can't skew it)",
+                 font=FONT, bg=BG_PNL, fg=FG_MUT).pack(side=tk.LEFT, padx=8)
+
+        # Live load-cell feed.
+        self._cal_fig = Figure(figsize=(8, 2.2), dpi=96, facecolor=BG)
+        self._cal_ax  = self._cal_fig.add_subplot(111)
+        self._cal_fig.subplots_adjust(left=0.07, right=0.99, top=0.95, bottom=0.22)
+        self._cal_canvas = FigureCanvasTkAgg(self._cal_fig, master=ctl)
+        self._cal_canvas.get_tk_widget().pack(fill=tk.X, pady=(0, 8))
+
+        grid = tk.Frame(ctl, bg=BG_PNL)
+        grid.pack(fill=tk.X)
+        for col, hd in enumerate(["Exp", "Side", "ID",
+                                   "Baseline (empty)", "",
+                                   "Offset (empty bottle)", "",
+                                   "Gain (50 g)", "", "Status"]):
+            tk.Label(grid, text=hd, font=FONTB, bg=BG_PNL, fg=FG_MUT
+                     ).grid(row=0, column=col, padx=5, pady=3, sticky="w")
+
+        self._snap_svars: Dict[tuple, tk.StringVar] = {}
+        cal_loaded = (self._settings.get("ports", {})
+                      .get(self._reader.port, {}).get("calibration", {}))
+        r = 1
+        for exp_id in range(1, self.num_boxes + 1):
+            ch = EXPERIMENT_CHANNELS[exp_id]
+            for side, load_id in (("Left",  ch["left_load"]),
+                                   ("Right", ch["right_load"])):
+                self._cal_cells.append((exp_id, side, load_id))
+                for col, txt in ((0, str(exp_id)), (1, side), (2, f"{load_id}")):
+                    tk.Label(grid, text=txt, font=FONTM if col == 2 else FONT,
+                             bg=BG_PNL, fg=FG_MUT if col == 2 else FG
+                             ).grid(row=r, column=col, padx=5)
+
+                csec   = cal_loaded.get(str(exp_id), {})
+                side_l = side.lower()
+                m = self._models[exp_id]
+
+                # baseline (stage 1), offset (stage 2), gain (stage 3)
+                specs = (("baseline", "Snap baseline", self._snap_baseline),
+                         ("offset",   "Snap Bottle",   None),
+                         ("gain",     "Snap 50 g",     None))
+                for ci, (kind, btn_txt, fn) in enumerate(specs):
+                    init = csec.get(f"{kind}_weight_{side_l}")
+                    sv = tk.StringVar(value=f"{init:.1f}" if init is not None else "—")
+                    self._snap_svars[(exp_id, side, kind)] = sv
+                    if init is not None:
+                        if kind == "offset":
+                            if side == "Left":  m.offset_weight_left  = float(init)
+                            else:               m.offset_weight_right = float(init)
+                            self._offset_done.add(load_id)
+                        elif kind == "baseline":
+                            if side == "Left":  m.baseline_weight_left  = float(init)
+                            else:               m.baseline_weight_right = float(init)
+                    tk.Label(grid, textvariable=sv, font=FONTM, bg=BG_PNL,
+                             fg=FG, width=7
+                             ).grid(row=r, column=3 + ci * 2, padx=3)
+                    if fn is not None:
+                        cmd = (lambda e=exp_id, s=side, lid=load_id: fn(e, s, lid))
+                    else:
+                        cmd = (lambda e=exp_id, s=side, lid=load_id,
+                               k=kind: self._snap(e, s, lid, k))
+                    b = tk.Button(grid, text=btn_txt, font=FONTB, bg=BG_ALT,
+                                  fg=FG, relief=tk.FLAT, padx=5,
+                                  state=tk.DISABLED, command=cmd)
+                    b.grid(row=r, column=4 + ci * 2, padx=2)
+                    self._snap_btns[(exp_id, side, kind)] = b
+                    self._cal_lock_buttons.append(b)
+
+                stv = tk.StringVar(value="waiting for stable weight…")
+                self._snap_svars[(exp_id, side, "status")] = stv
+                tk.Label(grid, textvariable=stv, font=FONTM, bg=BG_PNL,
+                         fg=CLR_GRN, width=26
+                         ).grid(row=r, column=9, padx=8, sticky="w")
+                r += 1
+
+        # ── All-at-once + touch calibration ───────────────────────────────────
+        allrow = tk.Frame(ctl, bg=BG_PNL); allrow.pack(fill=tk.X, pady=(10, 0))
+        tk.Label(allrow, text="All cells at once:", font=FONT, bg=BG_PNL, fg=FG
+                 ).pack(side=tk.LEFT, padx=(0, 8))
+        ob = tk.Button(allrow, text="Offset all (empty bottles)", font=FONTB,
+                       bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=8,
+                       command=lambda: self._snap_all("offset"))
+        ob.pack(side=tk.LEFT, padx=4)
+        gb = tk.Button(allrow, text="Gain all (50 g)", font=FONTB,
+                       bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=8,
+                       command=lambda: self._snap_all("gain"))
+        gb.pack(side=tk.LEFT, padx=4)
+        tcb = tk.Button(allrow, text="Touch sensor cal ('t')", font=FONTB,
                         bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=8,
-                        command=lambda: self._reader.send(f"k{self._gcal_ch.get()}g"))
-        kgb.grid(row=2, column=2, sticky="w", padx=4)
-        self._cal_lock_buttons.append(kgb)
+                        command=lambda: self._reader.send("t"))
+        tcb.pack(side=tk.LEFT, padx=12)
+        self._cal_lock_buttons.extend([ob, gb, tcb])
+
+        # ── Drift correction (C5) ─────────────────────────────────────────────
+        dr = section("Load-cell drift correction",
+                     "Estimates drift from no-lick periods (linear fit of weight "
+                     "vs time while the mouse isn't licking) and subtracts the "
+                     "accumulated drift from the saved weight.")
+        sh = self._settings["shared"]
+        self._drift_on_var  = tk.StringVar(value=str(sh.get("drift_enabled", 0)))
+        self._drift_win_var = tk.StringVar(value=str(sh.get("drift_min_window_s", 60)))
+        self._drift_pts_var = tk.StringVar(value=str(sh.get("drift_min_points", 4)))
+        drow = tk.Frame(dr, bg=BG_PNL); drow.pack(fill=tk.X)
+        tk.Checkbutton(
+            drow, variable=self._drift_on_var, onvalue="1", offvalue="0",
+            text="enable drift correction", font=FONT, bg=BG_PNL, fg=FG,
+            selectcolor=BG_ALT, activebackground=BG_PNL, activeforeground=FG
+            ).pack(side=tk.LEFT, padx=(0, 14))
+        tk.Label(drow, text="Min no-lick window (s):", font=FONT, bg=BG_PNL, fg=FG
+                 ).pack(side=tk.LEFT, padx=(0, 3))
+        tk.Spinbox(drow, from_=1, to=86400, increment=10,
+                   textvariable=self._drift_win_var, width=7, font=FONTM,
+                   bg=BG_ALT, fg=FG, relief=tk.FLAT).pack(side=tk.LEFT, padx=(0, 14))
+        tk.Label(drow, text="Min readings to fit:", font=FONT, bg=BG_PNL, fg=FG
+                 ).pack(side=tk.LEFT, padx=(0, 3))
+        tk.Spinbox(drow, from_=2, to=1000, increment=1,
+                   textvariable=self._drift_pts_var, width=6, font=FONTM,
+                   bg=BG_ALT, fg=FG, relief=tk.FLAT).pack(side=tk.LEFT, padx=(0, 14))
+        tk.Button(drow, text="Apply", font=FONTB, bg=CLR_GRN, fg="white",
+                  activebackground="#25A244", relief=tk.FLAT, padx=10,
+                  command=self._apply_drift_settings).pack(side=tk.LEFT)
+        self._apply_drift_settings(initial=True)
 
         # ── Touch thresholds ──────────────────────────────────────────────────
         th = section("Touch sensitivity thresholds",
@@ -2647,65 +2881,9 @@ class MainWindow(tk.Tk):
             tb_btn.grid(row=r, column=c * 3 + 2, padx=4)
             self._cal_lock_buttons.append(tb_btn)
 
-        # ── Software load-cell calibration ────────────────────────────────────
-        lc = section("Load cell software calibration",
-                     "1. Place 50g reference on bottle → Snap 50g.\n"
-                     "2. Remove reference, use actual bottle → Snap Bottle.\n"
-                     "Ratio = 50g_raw ÷ bottle_raw.  Applied to all load readings. "
-                     "Saved per-port and restored on next launch.")
-        grid = tk.Frame(lc, bg=BG_PNL)
-        grid.pack(fill=tk.X)
-
-        for col, hd in enumerate(["Exp", "Side", "Arduino ID",
-                                   "50g raw", "", "Bottle raw", "", "Ratio"]):
-            tk.Label(grid, text=hd, font=FONTB, bg=BG_PNL, fg=FG_MUT
-                     ).grid(row=0, column=col, padx=6, pady=3, sticky="w")
-
-        self._snap_svars: Dict[tuple, tk.StringVar] = {}
-        cal_loaded = (self._settings.get("ports", {})
-                      .get(self._reader.port, {}).get("calibration", {}))
-        r = 1
-        for exp_id in range(1, self.num_boxes + 1):
-            ch = EXPERIMENT_CHANNELS[exp_id]
-            for side, load_id in (("Left",  ch["left_load"]),
-                                   ("Right", ch["right_load"])):
-                key = (exp_id, side)
-                for col, txt in ((0, str(exp_id)), (1, side),
-                                  (2, f"id {load_id}")):
-                    tk.Label(grid, text=txt, font=FONTM if col == 2 else FONT,
-                             bg=BG_PNL,
-                             fg=FG_MUT if col == 2 else FG
-                             ).grid(row=r, column=col, padx=6)
-
-                # restore snapped raw values + ratio if present
-                csec  = cal_loaded.get(str(exp_id), {})
-                side_l = side.lower()
-                snaps = csec.get("snaps", {}).get(side_l, {})
-                for ci, snap_key in enumerate(("50g", "bottle")):
-                    init = snaps.get(snap_key)
-                    sv = tk.StringVar(value=f"{init:.1f}" if init is not None else "—")
-                    if init is not None:
-                        self._snaps[(load_id, snap_key)] = float(init)
-                    self._snap_svars[(exp_id, side, snap_key)] = sv
-                    tk.Label(grid, textvariable=sv, font=FONTM,
-                             bg=BG_PNL, fg=FG, width=10
-                             ).grid(row=r, column=3 + ci * 2, padx=4)
-                    lbl_txt = "Snap 50g" if ci == 0 else "Snap Bottle"
-                    snap_btn = tk.Button(grid, text=lbl_txt, font=FONTB,
-                                         bg=BG_ALT, fg=FG, relief=tk.FLAT, padx=6,
-                                         command=lambda k=key, sk=snap_key,
-                                         lid=load_id: self._snap(k, sk, lid))
-                    snap_btn.grid(row=r, column=4 + ci * 2, padx=2)
-                    self._cal_lock_buttons.append(snap_btn)
-
-                ratio_init = csec.get(f"cal_{side_l}")
-                sv_r = tk.StringVar(
-                    value=f"{ratio_init:.5f}" if ratio_init else "—")
-                self._snap_svars[(exp_id, side, "ratio")] = sv_r
-                tk.Label(grid, textvariable=sv_r, font=FONTM,
-                         bg=BG_PNL, fg=CLR_GRN
-                         ).grid(row=r, column=7, padx=8)
-                r += 1
+        # Start the live-feed + stability tick.
+        self._cal_built = True
+        self._cal_job = self.after(400, self._cal_tick)
 
     # ── Tab: Flag Settings (Task 2b/2c) ───────────────────────────────────────
 
@@ -3248,31 +3426,68 @@ class MainWindow(tk.Tk):
                                      bg=CLR_GRN, activebackground="#25A244")
             self._cancel_init_lockout()          # Task S1
 
-    # ── Task S1: post-stream initialisation lockout ──────────────────────────
+    # ── Task S1 / C3: reactive post-stream initialisation ────────────────────
     def _begin_init_lockout(self):
-        """Lock run + calibration buttons for 9 s and rotate the init messages."""
+        """Lock run + calibration buttons and rotate the init messages until the
+        streamed load-cell values have actually settled (reactive, not timed)."""
         self._set_controls_locked(True)
         self._init_idx = 0
+        self._init_stable = False
+        self._init_t0 = time.monotonic()
         self._show_next_init_msg()
-        self._init_unlock_job = self.after(INIT_LOCKOUT_MS,
-                                           self._end_init_lockout)
+        self._check_init_stable()
 
     def _show_next_init_msg(self):
-        """Advance the rotating initialisation message every 1.5 s."""
-        if self._init_idx < len(INIT_MSGS):
-            self._init_lbl.config(text=INIT_MSGS[self._init_idx])
-            self._init_idx += 1
-            self._init_msg_job = self.after(INIT_STEP_MS,
-                                            self._show_next_init_msg)
+        """Cycle the “initializing…” messages at a fixed rate until stable, then
+        leave the final ‘ready to lick’ line."""
+        if getattr(self, "_init_stable", False):
+            self._init_lbl.config(text=INIT_MSGS[-1])
+            return
+        spin = INIT_MSGS[:-1] or INIT_MSGS         # all but the final message
+        self._init_lbl.config(text=spin[self._init_idx % len(spin)])
+        self._init_idx += 1
+        self._init_msg_job = self.after(INIT_STEP_MS, self._show_next_init_msg)
 
-    def _end_init_lockout(self):
-        """Re-enable run + calibration once the 9 s lockout elapses."""
+    def _init_cell_settled(self, load_id: int) -> bool:
+        """A load cell counts as settled once it has ≥2 readings and its last few
+        readings lie within the stability threshold (works at any stream rate)."""
+        buf = self._cal_buf.get(int(load_id), [])
+        if len(buf) < 2:
+            return False
+        _, thresh, _ = self._cal_params()
+        last = [v for (_, v) in buf[-3:]]
+        return (max(last) - min(last)) <= thresh
+
+    def _check_init_stable(self):
+        """Poll until every active load cell has settled (or the safety cap)."""
+        if getattr(self, "_init_stable", False):
+            return
+        cells = getattr(self, "_cal_cells", [])
+        have_any = any(self._cal_buf.get(lid) for (_, _, lid) in cells)
+        settled = bool(cells) and have_any and \
+            all(self._init_cell_settled(lid) for (_, _, lid) in cells)
+        timed_out = (time.monotonic() - self._init_t0) * 1000.0 >= INIT_MAX_MS
+        if settled or timed_out:
+            self._end_init_lockout(timed_out=timed_out and not settled)
+            return
+        self._init_check_job = self.after(500, self._check_init_stable)
+
+    def _end_init_lockout(self, timed_out: bool = False):
+        """Re-enable run + calibration once load values have stabilised."""
+        self._init_stable = True
         self._set_controls_locked(False)
         self._init_lbl.config(text=INIT_MSGS[-1])   # leave 'ready to lick'
+        if timed_out:
+            self.emit_alert(None, "initialization proceeded without stable load "
+                                  "values (safety timeout)", level="warning")
+        else:
+            self.emit_alert(None, "initialization complete — load values stable",
+                            level="info")
 
     def _cancel_init_lockout(self):
-        """Cancel any pending lockout (e.g. stream stopped early) and unlock."""
-        for attr in ("_init_unlock_job", "_init_msg_job"):
+        """Cancel any pending init jobs (e.g. stream stopped early) and unlock."""
+        self._init_stable = True
+        for attr in ("_init_unlock_job", "_init_msg_job", "_init_check_job"):
             job = getattr(self, attr, None)
             if job is not None:
                 try:
@@ -3285,6 +3500,7 @@ class MainWindow(tk.Tk):
 
     def _set_controls_locked(self, locked: bool):
         """Enable/disable every Run + calibration button together (Task S1)."""
+        self._cal_locked = locked
         for q in self._quadrants:
             q.set_run_locked(locked)
         for b in getattr(self, "_cal_lock_buttons", []):
@@ -3308,53 +3524,306 @@ class MainWindow(tk.Tk):
         # Task 3: persist per-port threshold
         save_port_section(self._reader.port, "thresholds", {str(ch): n})
 
-    def _snap(self, key: tuple, snap_key: str, load_id: int):
-        """Record a load-cell snap reading (50g or bottle), compute the calibration ratio, and persist it."""
-        raw = self._last_raw.get(load_id)
-        if raw is None:
-            messagebox.showwarning("No data",
-                f"No reading yet for load ID {load_id}. "
-                "Start the Arduino stream first.")
+    def _cal_params(self):
+        """Stability delay (s), threshold (g) and weight-present threshold (g)
+        from the calibration tab, with safe fallbacks."""
+        def f(attr, default):
+            try:
+                return float(getattr(self, attr).get())
+            except (AttributeError, ValueError, tk.TclError):
+                return default
+        return (max(0.5, f("_cal_delay_var", 5.0)),
+                max(0.001, f("_cal_thresh_var", 0.1)),
+                max(0.0, f("_cal_present_var", 0.5)))
+
+    def _cell_stable(self, load_id: int) -> bool:
+        """True when the cell's recent readings span ≥ delay seconds and lie
+        within the stability threshold (g) of each other."""
+        delay, thresh, _ = self._cal_params()
+        buf = self._cal_buf.get(int(load_id), [])
+        if len(buf) < 2:
+            return False
+        now = buf[-1][0]
+        recent = [(t, v) for (t, v) in buf if t >= now - delay * 1000.0]
+        if len(recent) < 2:
+            return False
+        if (recent[-1][0] - recent[0][0]) < delay * 1000.0 * 0.6:
+            return False                       # window not yet long enough
+        vals = [v for (_, v) in recent]
+        return (max(vals) - min(vals)) <= thresh
+
+    def _draw_cal_feed(self, delay):
+        """Redraw the live load-cell feed (recent grams per active cell)."""
+        ax = self._cal_ax
+        ax.cla()
+        ax.set_facecolor(BG_PNL)
+        for sp in ax.spines.values():
+            sp.set_color(BG_ALT)
+        now = self._arduino_ts[0]
+        win_ms = max(30.0, delay * 5.0) * 1000.0
+        plotted = False
+        for (exp_id, side, load_id) in self._cal_cells:
+            buf = self._cal_buf.get(load_id, [])
+            pts = [(t, v) for (t, v) in buf if t >= now - win_ms]
+            if not pts:
+                continue
+            xs = [(t - now) / 1000.0 for (t, _) in pts]
+            ys = [v for (_, v) in pts]
+            color = CLR_L if side == "Left" else CLR_R
+            ax.plot(xs, ys, color=color, linewidth=1.2, marker="o",
+                    markersize=2, label=f"B{exp_id} {side[0]} (id{load_id})")
+            plotted = True
+        ax.set_xlabel("seconds ago", color=FG_MUT, fontsize=7)
+        ax.set_ylabel("grams", color=FG_MUT, fontsize=7)
+        ax.tick_params(colors=FG_MUT, labelsize=6)
+        if plotted:
+            ax.legend(loc="upper left", fontsize=5, ncol=4, framealpha=0.2,
+                      facecolor=BG_PNL, edgecolor=BG_ALT, labelcolor=FG)
+        else:
+            ax.text(0.5, 0.5, "waiting for load-cell stream…",
+                    ha="center", va="center", color=FG_MUT, fontsize=8,
+                    transform=ax.transAxes)
+        self._cal_canvas.draw_idle()
+
+    def _cal_tick(self):
+        """Periodic: redraw live feed, evaluate per-cell stability, enable/disable
+        snap buttons and update status messages."""
+        if not getattr(self, "_cal_built", False):
             return
-        self._snaps[(load_id, snap_key)] = raw
-        exp_id, side = key
-        self._snap_svars[(exp_id, side, snap_key)].set(f"{raw:.1f}")
+        delay, thresh, present_g = self._cal_params()
+        self._cal_present_g = present_g
+        try:
+            self._draw_cal_feed(delay)
+        except Exception:
+            pass
+        locked = getattr(self, "_cal_locked", False)
+        for (exp_id, side, load_id) in self._cal_cells:
+            stable = self._cell_stable(load_id)
+            base_b = self._snap_btns.get((exp_id, side, "baseline"))
+            off_b  = self._snap_btns.get((exp_id, side, "offset"))
+            gain_b = self._snap_btns.get((exp_id, side, "gain"))
+            if not locked:
+                for b in (base_b, off_b):
+                    if b is not None:
+                        b.config(state=tk.NORMAL if stable else tk.DISABLED)
+                if gain_b is not None:
+                    ok = stable and (load_id in self._offset_done)
+                    gain_b.config(state=tk.NORMAL if ok else tk.DISABLED)
+            sv = self._snap_svars.get((exp_id, side, "status"))
+            if sv is not None:
+                done = []
+                if load_id in self._offset_done:
+                    done.append("offset ✓")
+                gv = self._snap_svars.get((exp_id, side, "gain"))
+                if gv is not None and gv.get() not in ("—", ""):
+                    done.append("gain ✓")
+                if not stable:
+                    tail = "waiting for stable weight…"
+                elif load_id not in self._offset_done:
+                    tail = "stable — snap baseline/offset"
+                else:
+                    tail = "stable — snap gain"
+                sv.set(("  ".join(done) + "   " if done else "") + tail)
+        self._cal_job = self.after(500, self._cal_tick)
 
-        v50  = self._snaps.get((load_id, "50g"))
-        vbot = self._snaps.get((load_id, "bottle"))
-        ratio = None
+    def _snap_baseline(self, exp_id: int, side: str, load_id: int):
+        """Stage 1: capture the EMPTY-CELL stable baseline (no Arduino action)."""
+        if not self._cell_stable(load_id):
+            messagebox.showwarning("Not stable",
+                f"Load ID {load_id} hasn't stabilized yet.")
+            return
+        live = self._last_raw.get(load_id)
+        self._snap_svars[(exp_id, side, "baseline")].set(
+            f"{live:.1f}" if live is not None else "—")
         m = self._models[exp_id]
+        if side == "Left":  m.baseline_weight_left  = live
+        else:               m.baseline_weight_right = live
+        self._persist_cal(exp_id, side, "baseline", live)
+        self.emit_alert(None, f"Box {exp_id} {side}: empty-cell baseline "
+                              f"captured ({live:.2f} g)", level="info")
 
-        # When the bottle snap is recorded, store the raw value as the
-        # offset_weight baseline for the below-offset load flag (Flag 2).
-        # The offset is stored in raw ADC units; it will be multiplied by the
-        # calibration ratio once that is computed below.
-        if snap_key == "bottle":
-            # Store as raw for now; recomputed after ratio is known.
-            self._snaps[(load_id, "bottle_raw")] = raw
+    def _apply_drift_settings(self, initial: bool = False):
+        """Push drift settings to every model and persist them (shared)."""
+        try:
+            enabled = self._drift_on_var.get() == "1"
+            win_s   = float(self._drift_win_var.get())
+            pts     = int(float(self._drift_pts_var.get()))
+        except (AttributeError, ValueError, tk.TclError):
+            if initial:
+                return
+            messagebox.showerror("Bad value",
+                                 "Drift settings must be numbers.")
+            return
+        for m in self._models.values():
+            m.set_drift_params(enabled, win_s, pts)
+        for k, v in (("drift_enabled", 1 if enabled else 0),
+                     ("drift_min_window_s", win_s),
+                     ("drift_min_points", pts)):
+            save_shared_value(k, v)
+            self._settings["shared"][k] = v
+        if not initial:
+            self.emit_alert(None, f"drift correction {'on' if enabled else 'off'} "
+                                  f"(≥{win_s:g}s window, ≥{pts} reads)",
+                            level="info")
 
-        if v50 is not None and vbot is not None and vbot != 0:
-            ratio = v50 / vbot
-            self._snap_svars[(exp_id, side, "ratio")].set(f"{ratio:.5f}")
-            if side == "Left":
-                m.cal_left  = ratio
-                # Calibrated offset weight = raw bottle reading × ratio
-                m.offset_weight_left  = vbot * ratio
-            else:
-                m.cal_right = ratio
-                # Calibrated offset weight = raw bottle reading × ratio
-                m.offset_weight_right = vbot * ratio
+    def _gain_avg_ms(self) -> int:
+        """Gain averaging window in ms (from the cal tab), clamped to 100–60000."""
+        try:
+            ms = int(round(float(self._gain_avg_var.get()) * 1000))
+        except (AttributeError, ValueError, tk.TclError):
+            ms = 2000
+        return max(100, min(60000, ms))
 
-        # Task 3: persist calibration (raw snaps + ratio) per-port, per-exp.
+    def _set_gain_avg(self):
+        """Send the gain averaging window to the Arduino ('wNNNNN') and persist."""
+        ms = self._gain_avg_ms()
+        self._reader.send(f"w{ms}")
+        save_shared_value("gain_avg_ms", ms)
+        self._settings["shared"]["gain_avg_ms"] = ms
+        self.emit_alert(None, f"gain averaging window set to {ms} ms "
+                              f"({ms/1000:g} s)", level="info")
+
+    def _cal_channel_of(self, load_id: int) -> int:
+        """Arduino channel (0-7) for a load-cell id (ids 0-7 map 1:1 to channels)."""
+        return int(load_id)
+
+    def _weight_present_ok(self, load_id: int, kind: str) -> bool:
+        """If the weight-present check is on, refuse to calibrate a cell that is
+        reading ~nothing (no bottle / no 50 g placed). Same rule for offset+gain."""
+        if not getattr(self, "_weight_present_var", None) or \
+           self._weight_present_var.get() != "1":
+            return True
+        live = self._last_raw.get(load_id)
+        thing = "empty bottle" if kind == "offset" else "50 g weight"
+        if live is None:
+            messagebox.showwarning(
+                "No live reading",
+                f"No streamed weight yet for load ID {load_id}. Start the "
+                f"Arduino stream and place the {thing} first.")
+            return False
+        if abs(live) < self._cal_present_g:
+            messagebox.showwarning(
+                "No weight present",
+                f"Load ID {load_id} reads {live:.2f} g (< {self._cal_present_g:g} g). "
+                f"Place the {thing} on the cell before calibrating.")
+            self.emit_alert(None, f"Calibration refused (ID {load_id}): "
+                                  f"no weight present", level="warning")
+            return False
+        return True
+
+    def _snap(self, exp_id: int, side: str, load_id: int, kind: str):
+        """Tell the Arduino to (re)calibrate one cell.
+
+        kind == "offset" → empty-bottle offset cal (per-channel 'Nko');
+        kind == "gain"   → 50 g gain cal (per-channel 'kNg'). Gain is blocked
+        until that cell's offset has been snapped this session.
+        """
+        # Gating: gain requires offset first for this cell.
+        if kind == "gain" and load_id not in self._offset_done:
+            messagebox.showwarning(
+                "Offset first",
+                f"Run the offset (Snap Bottle) for load ID {load_id} before "
+                f"the gain (Snap 50 g).")
+            return
+        # Stability gate: only calibrate once the reading has settled.
+        if not self._cell_stable(load_id):
+            messagebox.showwarning(
+                "Not stable",
+                f"Load ID {load_id} hasn't stabilized yet — wait for the live "
+                f"feed to settle within the stability threshold.")
+            return
+        # Weight-present guard.
+        if not self._weight_present_ok(load_id, kind):
+            return
+
+        live = self._last_raw.get(load_id)
+        ch   = self._cal_channel_of(load_id)
+        if kind == "offset":
+            self._reader.send(f"{ch}ko")        # per-channel offset (new sketch cmd)
+            self._offset_done.add(load_id)
+            m = self._models[exp_id]
+            if side == "Left":  m.offset_weight_left  = live
+            else:               m.offset_weight_right = live
+        else:
+            self._reader.send(f"w{self._gain_avg_ms()}")   # C4: set window first
+            self._reader.send(f"k{ch}g")        # per-channel gain (existing cmd)
+
+        self._snap_svars[(exp_id, side, kind)].set(
+            f"{live:.1f}" if live is not None else "sent")
+        self._update_cal_status(exp_id, side)
+        self.emit_alert(None, f"Box {exp_id} {side}: {kind} calibration sent "
+                              f"(ID {load_id})", level="info")
+        self._persist_cal(exp_id, side, kind, live)
+
+    def _snap_all(self, kind: str):
+        """Calibrate every load cell at once (offset → 'o', gain → 'cg')."""
+        # Gain-all requires offset done on every cell first.
+        load_ids = []
+        for exp_id in range(1, self.num_boxes + 1):
+            ch = EXPERIMENT_CHANNELS[exp_id]
+            load_ids += [(exp_id, "Left", ch["left_load"]),
+                         (exp_id, "Right", ch["right_load"])]
+        if kind == "gain":
+            missing = [lid for _, _, lid in load_ids if lid not in self._offset_done]
+            if missing:
+                messagebox.showwarning(
+                    "Offset first",
+                    "Run offset on all cells before gain. Missing offset for "
+                    f"IDs: {sorted(set(missing))}.")
+                return
+        # Weight-present + stability guard across all cells.
+        for _, _, lid in load_ids:
+            if not self._cell_stable(lid):
+                messagebox.showwarning(
+                    "Not stable",
+                    f"Load ID {lid} hasn't stabilized yet. Wait for every cell "
+                    f"to settle before calibrating all at once.")
+                return
+            if not self._weight_present_ok(lid, kind):
+                return
+        if kind == "gain":
+            # ensure the Arduino has the current averaging window before 'cg'
+            self._reader.send(f"w{self._gain_avg_ms()}")
+        self._reader.send("o" if kind == "offset" else "cg")
+        for exp_id, side, lid in load_ids:
+            live = self._last_raw.get(lid)
+            if kind == "offset":
+                self._offset_done.add(lid)
+                m = self._models[exp_id]
+                if side == "Left":  m.offset_weight_left  = live
+                else:               m.offset_weight_right = live
+            self._snap_svars[(exp_id, side, kind)].set(
+                f"{live:.1f}" if live is not None else "sent")
+            self._update_cal_status(exp_id, side)
+            self._persist_cal(exp_id, side, kind, live)
+        self.emit_alert(None, f"All cells: {kind} calibration sent", level="info")
+
+    def _update_cal_status(self, exp_id: int, side: str):
+        """Refresh the per-cell status text (offset ✓ / gain ✓ / locked)."""
+        ch = EXPERIMENT_CHANNELS[exp_id]
+        load_id = ch["left_load"] if side == "Left" else ch["right_load"]
+        off = load_id in getattr(self, "_offset_done", set())
+        gain_val = self._snap_svars.get((exp_id, side, "gain"))
+        gained = gain_val is not None and gain_val.get() not in ("—", "")
+        if off and gained:
+            txt = "offset ✓  gain ✓"
+        elif off:
+            txt = "offset ✓  (gain ready)"
+        else:
+            txt = "gain locked — do offset"
+        sv = self._snap_svars.get((exp_id, side, "status"))
+        if sv is not None:
+            sv.set(txt)
+
+    def _persist_cal(self, exp_id: int, side: str, kind: str, value):
+        """Persist a snap (offset/gain reference weight) per-port, per-exp."""
         side_l = side.lower()
         data = load_settings()
         psec  = data.setdefault("ports", {}).setdefault(self._reader.port, {})
         cal   = psec.setdefault("calibration", {})
         csec  = cal.setdefault(str(exp_id), {})
-        snaps = csec.setdefault("snaps", {}).setdefault(side_l, {})
-        snaps[snap_key] = raw
-        if ratio is not None:
-            csec[f"cal_{side_l}"] = ratio
+        if value is not None:
+            csec[f"{kind}_weight_{side_l}"] = float(value)
         _write_settings(data)
 
     def _apply_flag_settings(self):
@@ -3516,6 +3985,13 @@ class MainWindow(tk.Tk):
             amp = msg["amp"]
             self._arduino_ts[0] = ts
             self._last_raw[aid] = amp
+            # C2: keep a bounded rolling buffer of load readings for the
+            # calibration live feed + stability detection (ids 0-7 are loads).
+            if 0 <= aid <= 7:
+                buf = self._cal_buf.setdefault(aid, [])
+                buf.append((ts, amp))
+                if len(buf) > 600:
+                    del buf[:len(buf) - 600]
             for model in self._models.values():
                 if model.owns(aid):
                     # ingest() returns a list of flag strings for load-cell events;
