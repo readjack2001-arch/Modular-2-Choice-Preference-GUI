@@ -227,6 +227,40 @@ DEFAULT_SETTINGS = {
             "full_rows":            FULL_ROWS,
             "full_seconds_per_row": FULL_SECONDS_PER_ROW,
             "full_bin_seconds":     FULL_BIN_SECONDS,
+            # ── Titles / axis labels (Task L6-L13) ──
+            # "{n}" is replaced by the box number, so renaming the template
+            # renames every plot while keeping each box distinguishable.
+            "title_full":     "Box {n}",
+            "xlabel_full":    "time within hour",
+            "ylabel_full":    "Interval (hour)",
+            "title_monitor":  "Box {n}",
+            "xlabel_monitor": "time (min)",
+            "ylabel_monitor": "time since start",
+            # ── Fonts (Task L9/L10/LG21) — bigger defaults than before ──
+            "title_font":      "DejaVu Sans",
+            "tick_font":       "DejaVu Sans",
+            "legend_font":     "DejaVu Sans",
+            "title_size_full":     14,
+            "title_size_monitor":  12,
+            "axislabel_size_full":    12,
+            "axislabel_size_monitor": 10,
+            "tick_size_full":      11,
+            "tick_size_monitor":   9,
+            "legend_size_full":    12,
+            "legend_size_monitor": 10,
+            # ── Heatmap (Box-tab lick colour-bars) — Task HM15-HM19 ──
+            "heat_label_l":   "L Number of Licks / {bin}s bin",
+            "heat_label_r":   "R Number of Licks / {bin}s bin",
+            "heat_auto":      1,      # 1 = auto min/max from data; 0 = manual
+            "heat_vmin":      1,      # manual min count (when auto off)
+            "heat_vmax":      10,     # manual max count (when auto off)
+            "heat_ticks":     5,      # number of intensity ticks on each bar
+            "heat_palette":   "Tol muted",   # colour-blind-safe scheme name
+            "heat_light":     0.85,   # 0=base hue … 1=white at the faint end
+            "heat_dark":      0.0,    # 0=base hue … 1=black at the dense end
+            "heat_font":      "DejaVu Sans",
+            "heat_title_size": 11,
+            "heat_tick_size":  10,
         },
         "save_folder":      "",
         "weight_interval":  30,
@@ -572,7 +606,8 @@ def _open_onset(ons: List[int], offs: List[int]) -> Optional[int]:
 class EventRow:
     timestamp_ms: int
     event_id:     int
-    amplitude:    float
+    amplitude:    float          # calibrated value (load weight in g for load events)
+    raw:          float = 0.0     # EL23: raw pre-calibration amplitude
 
 
 class ExperimentModel:
@@ -632,10 +667,17 @@ class ExperimentModel:
         """Return milliseconds elapsed since experiment start, clamped to 0."""
         return max(0, ts - self.start_ts) if self.start_ts is not None else 0
 
-    def add(self, ts_ms: int, eid: int, amp: float = 0.0):
-        """Append one EventRow to the thread-safe event log."""
+    def add(self, ts_ms: int, eid: int, amp: float = 0.0,
+            raw: Optional[float] = None):
+        """Append one EventRow to the thread-safe event log.
+
+        `raw` (EL23) is the pre-calibration amplitude; for load events the caller
+        passes the raw reading while `amp` holds the calibrated weight. When not
+        given it defaults to `amp` (lick/onset events have no separate raw value).
+        """
         with self._lock:
-            self._log.append(EventRow(ts_ms, eid, amp))
+            self._log.append(EventRow(ts_ms, eid, amp,
+                                      amp if raw is None else raw))
 
     def get_log(self) -> List[EventRow]:
         """Return a snapshot copy of the event log (thread-safe)."""
@@ -643,16 +685,41 @@ class ExperimentModel:
             return list(self._log)
 
     def export_npy(self, path: str):
-        """Save the event log as a structured NumPy .npy file with fields timestamp_ms, event_id, amplitude."""
+        """Save the event log as a structured NumPy .npy file (EL22/EL23).
+
+        Fields: timestamp_ms, event_id, amplitude (calibrated weight for load
+        events) and raw_amplitude (the pre-calibration reading).
+        """
         log = self.get_log()
         if not log:
             return
         arr = np.array(
-            [(r.timestamp_ms, r.event_id, r.amplitude) for r in log],
-            dtype=[("timestamp_ms", np.int64),
-                   ("event_id",     np.int8),
-                   ("amplitude",    np.float32)])
+            [(r.timestamp_ms, r.event_id, r.amplitude, r.raw) for r in log],
+            dtype=[("timestamp_ms",  np.int64),
+                   ("event_id",      np.int8),
+                   ("amplitude",     np.float32),
+                   ("raw_amplitude", np.float32)])
         np.save(path, arr)
+
+    def export_csv(self, path: str):
+        """Save the event log as a .csv with raw + calibrated columns (EL22/EL23)."""
+        log = self.get_log()
+        if not log:
+            return
+        import csv
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["timestamp_ms", "event_id", "event_name",
+                        "raw_amplitude", "calibrated_amplitude"])
+            for r in log:
+                w.writerow([r.timestamp_ms, r.event_id,
+                            _EVT_NAME.get(r.event_id, str(r.event_id)),
+                            f"{r.raw:.4f}", f"{r.amplitude:.4f}"])
+
+    def export_log(self, stem: str):
+        """Write both .npy and .csv for the event log (EL22). `stem` has no extension."""
+        self.export_npy(stem + ".npy")
+        self.export_csv(stem + ".csv")
 
     def ingest(self, ts: int, aid: int, amp: float):
         """
@@ -690,7 +757,7 @@ class ExperimentModel:
             if self.initial_load_left is None:
                 self.initial_load_left = cal_val
 
-            self.add(el, _L_LOAD, cal_val)
+            self.add(el, _L_LOAD, cal_val, raw=amp)
 
             # Flag 1: drink detected — weight rose more than DRINK_DELTA_G above initial
             if self.initial_load_left is not None:
@@ -728,7 +795,7 @@ class ExperimentModel:
             if self.initial_load_right is None:
                 self.initial_load_right = cal_val
 
-            self.add(el, _R_LOAD, cal_val)
+            self.add(el, _R_LOAD, cal_val, raw=amp)
 
             # Flag 1: drink detected — weight rose more than DRINK_DELTA_G above initial
             if self.initial_load_right is not None:
@@ -1005,10 +1072,24 @@ class RasterPanel:
         self.load_show   = True     # Task V1
         self.load_lw     = 0.9      # monitor load line width
 
+        # Titles / labels / fonts (Task L11-L13, L9, L10, LG21) — overwritten
+        # from the visuals tab via apply_style(); defaults set here so the panel
+        # renders before settings are pushed.
+        self.title_tmpl     = "Box {n}"
+        self.xlabel_txt     = "time (min)"
+        self.ylabel_txt     = "time since start"
+        self.title_font     = "DejaVu Sans"
+        self.tick_font      = "DejaVu Sans"
+        self.legend_font    = "DejaVu Sans"
+        self.title_size     = 12
+        self.axislabel_size = 10
+        self.tick_size      = 9
+        self.legend_size    = 10
+
         # A single, fixed-size figure — no scroll canvas, no figure resizing.
         self._fig = Figure(figsize=(6, 2.6), dpi=96, facecolor=BG_PNL)
         self._ax  = self._fig.add_subplot(111)
-        self._fig.subplots_adjust(left=0.10, right=0.92, top=0.86, bottom=0.18)
+        self._fig.subplots_adjust(left=0.10, right=0.92, top=0.80, bottom=0.18)
         self._canvas = FigureCanvasTkAgg(self._fig, master=parent)
         self._canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self._render([])
@@ -1020,6 +1101,19 @@ class RasterPanel:
         return max(1, (self.seconds_per_row * 1000) // self.timebin_ms)
 
     # ── configuration setters ──────────────────────────────────────────────────
+    def apply_style(self, cfg: dict):
+        """Pull title/label/font settings from the visuals tab (Task L11-L13/L9/L10/LG21)."""
+        self.title_tmpl     = cfg.get("title_monitor", "Box {n}")
+        self.xlabel_txt     = cfg.get("xlabel_monitor", "time (min)")
+        self.ylabel_txt     = cfg.get("ylabel_monitor", "time since start")
+        self.title_font     = cfg.get("title_font", "DejaVu Sans")
+        self.tick_font      = cfg.get("tick_font", "DejaVu Sans")
+        self.legend_font    = cfg.get("legend_font", "DejaVu Sans")
+        self.title_size     = float(cfg.get("title_size_monitor", 12))
+        self.axislabel_size = float(cfg.get("axislabel_size_monitor", 10))
+        self.tick_size      = float(cfg.get("tick_size_monitor", 9))
+        self.legend_size    = float(cfg.get("legend_size_monitor", 10))
+
     def set_load_axis(self, ymin: float, ymax: float, yticks: int,
                       show: Optional[bool] = None,
                       linewidth: Optional[float] = None):
@@ -1164,7 +1258,7 @@ class RasterPanel:
         ax.set_facecolor(BG_PNL)
         for sp in ax.spines.values():
             sp.set_color(BG_ALT)
-        ax.tick_params(colors=FG_MUT, labelsize=6)
+        ax.tick_params(colors=FG_MUT, labelsize=self.tick_size)
 
         # X axis labelled in MINUTES (tick spacing snapped to a nice value).
         row_s = self.seconds_per_row
@@ -1175,9 +1269,11 @@ class RasterPanel:
         x_ticks  = np.arange(0, bpr + 1, step)
         x_labels = [f"{(t * tb / 60000):g}" for t in x_ticks]   # bins → minutes
         ax.set_xticks(x_ticks)
-        ax.set_xticklabels(x_labels, fontsize=6, color=FG_MUT)
+        ax.set_xticklabels(x_labels, fontsize=self.tick_size, color=FG_MUT,
+                           fontfamily=self.tick_font)
         ax.set_xlim(0, bpr)
-        ax.set_xlabel("min", fontsize=6, color=FG_MUT, labelpad=1)
+        ax.set_xlabel(self.xlabel_txt, fontsize=self.axislabel_size,
+                      color=FG_MUT, labelpad=2, fontfamily=self.title_font)
 
         # Inverted y so the earliest visible row is at the TOP.
         ax.set_ylim(n_disp, 0)
@@ -1185,9 +1281,15 @@ class RasterPanel:
         ax.set_yticklabels(
             [_fmt_hms((first_row + d) * self.seconds_per_row)
              for d in range(n_disp)],
-            fontsize=6, color=FG_MUT)
+            fontsize=self.tick_size, color=FG_MUT, fontfamily=self.tick_font)
+        ax.set_ylabel(self.ylabel_txt, fontsize=self.axislabel_size,
+                      color=FG_MUT, fontfamily=self.title_font)
 
-        ax.set_title(f"Box {self.exp_id}", fontsize=8, color=FG, pad=3, loc="left")
+        ax.set_title(self.title_tmpl.replace("{n}", str(self.exp_id)),
+                     fontsize=self.title_size, color=FG, loc="left", y=1.02,
+                     fontfamily=self.title_font)
+        # LG20/LG21: legend ABOVE the raster (its own row, above the title),
+        # off the plot area so it never overlaps the data.
         ax.legend(
             handles=[
                 mpatches.Patch(color=CLR_L,           label="L lick"),
@@ -1196,8 +1298,10 @@ class RasterPanel:
                 mpatches.Patch(color=CLR_R, alpha=.4, label="R load"),
                 mpatches.Patch(color=CLR_EXP,         label="Onset/Off"),
             ],
-            loc="upper right", fontsize=5, framealpha=0.25,
-            facecolor=BG_PNL, edgecolor=BG_ALT, labelcolor=FG, ncol=5)
+            loc="lower right", bbox_to_anchor=(1.0, 1.12), borderaxespad=0,
+            framealpha=0.25, facecolor=BG_PNL, edgecolor=BG_ALT,
+            labelcolor=FG, ncol=5,
+            prop={"family": self.legend_font, "size": self.legend_size})
 
     def _draw_load_ticks(self, ax, n_disp: int, bpr: int):
         """Dotted reference lines + gram labels for the load scale (Task 5).
@@ -1289,6 +1393,7 @@ class ExpQuadrant(tk.Frame):
             timebin_ms=mp["monitor_timebin_ms"],
             seconds_per_row=mp["monitor_seconds_per_row"])
         pv = self._host.plot_settings()
+        self._raster.apply_style(pv)
         self._raster.set_load_axis(pv["load_ymin"], pv["load_ymax"],
                                    pv["load_yticks"],
                                    show=bool(pv.get("load_show", 1)))
@@ -1309,11 +1414,12 @@ class ExpQuadrant(tk.Frame):
             s.configure(widget, **cfg)
         s.map("Treeview", background=[("selected", BG_ALT)])
 
-        cols = ("ts", "id", "event", "amp")
+        cols = ("ts", "id", "event", "raw", "amp")
         self._tree = ttk.Treeview(log_outer, columns=cols,
                                    show="headings", height=5)
-        for c, w, lbl in (("ts", 72, "min"), ("id", 36, "ID"),
-                           ("event", 95, "Event"), ("amp", 60, "Amp")):
+        for c, w, lbl in (("ts", 66, "min"), ("id", 32, "ID"),
+                           ("event", 88, "Event"),
+                           ("raw", 60, "Raw"), ("amp", 64, "Weight(g)")):
             self._tree.heading(c, text=lbl)
             self._tree.column(c, width=w, anchor=tk.CENTER)
 
@@ -1343,6 +1449,7 @@ class ExpQuadrant(tk.Frame):
         """Re-apply visuals-tab settings (load axis + monitor timing) and redraw."""
         pv = self._host.plot_settings()
         mp = self._host.monitor_settings()
+        self._raster.apply_style(pv)
         self._raster.set_load_axis(pv["load_ymin"], pv["load_ymax"],
                                    pv["load_yticks"],
                                    show=bool(pv.get("load_show", 1)))
@@ -1387,11 +1494,13 @@ class ExpQuadrant(tk.Frame):
             defaultextension=".npy",
             filetypes=[("NumPy", "*.npy")])
         if npy:
-            self.model.export_npy(npy)
-            png = os.path.splitext(npy)[0] + ".png"
+            stem_path = os.path.splitext(npy)[0]
+            self.model.export_log(stem_path)        # EL22: .npy + .csv
+            png = stem_path + ".png"
             # Save the full-experiment (imshow) view — the complete picture.
             self._host.save_full_png(self.model.exp_id, png)
-            messagebox.showinfo("Saved", f"Log  → {npy}\nPlot → {png}")
+            messagebox.showinfo("Saved",
+                                f"Log  → {stem_path}.npy + .csv\nPlot → {png}")
 
         self._run_btn.config(state=tk.NORMAL)
         self._stop_btn.config(state=tk.DISABLED)
@@ -1424,10 +1533,13 @@ class ExpQuadrant(tk.Frame):
         for e in events[self._shown:]:
             name = _EVT_NAME.get(e.event_id, f"#{e.event_id}")
             tag  = _EVT_TAG.get(e.event_id, "")
+            is_load = e.event_id in (_L_LOAD, _R_LOAD)
+            raw_str = f"{e.raw:.1f}" if is_load else ""   # EL23: raw amplitude
+            amp_str = f"{e.amplitude:.2f}" if is_load else f"{e.amplitude:.1f}"
             iid = self._tree.insert(
                 "", tk.END,
                 values=(f"{e.timestamp_ms / 60000:.3f}", e.event_id, name,
-                        f"{e.amplitude:.1f}"),
+                        raw_str, amp_str),
                 tags=(tag,))
             self._tree_items.append((e.timestamp_ms, iid))
         self._shown = len(events)
@@ -1470,12 +1582,35 @@ class FullViewPanel(tk.Frame):
     right = cyan, colour intensity = lick count, each with its own count
     colour-bar) plus offset load-cell line plots (left = teal, right = purple)."""
 
-    # Sequential colormaps: faint (least-dense bin) → saturated (densest bin).
-    # Tol-muted hues so L/R stay distinguishable for colour-blind viewers.
+    # Colour-blind-safe palettes (HM19): each gives the saturated/"dense" hue for
+    # the left and right spout. The actual colormap is built per-side from these
+    # plus the user's light/dark endpoint amounts.
+    HEAT_PALETTES = {
+        "Tol muted":         {"L": "#CC6677", "R": "#88CCEE"},
+        "Tol bright":        {"L": "#EE6677", "R": "#4477AA"},
+        "Tol high-contrast": {"L": "#DDAA33", "R": "#004488"},
+        "Okabe-Ito":         {"L": "#D55E00", "R": "#0072B2"},
+        "Wong":              {"L": "#E69F00", "R": "#56B4E9"},
+        "IBM":               {"L": "#DC267F", "R": "#648FFF"},
+    }
+
+    @staticmethod
+    def _make_heat_cmap(base_hex, light_amt, dark_amt):
+        """Build a faint→dense colormap from a base hue (HM19).
+
+        light_amt blends the faint end toward white (1 = white); dark_amt blends
+        the dense end toward black (0 = pure base hue, 1 = black).
+        """
+        base = np.array(mcolors.to_rgb(base_hex))
+        light = base + (1.0 - base) * float(np.clip(light_amt, 0.0, 1.0))
+        dark  = base * (1.0 - float(np.clip(dark_amt, 0.0, 1.0)))
+        return mcolors.LinearSegmentedColormap.from_list("heat", [light, dark])
+
+    # Default colormaps (overwritten per-instance by apply_heat()).
     _CMAP_L = mcolors.LinearSegmentedColormap.from_list(
-        "Lrose", ["#F2DCE0", "#CC6677"])     # pale rose → Tol rose (left)
+        "Lrose", ["#F2DCE0", "#CC6677"])
     _CMAP_R = mcolors.LinearSegmentedColormap.from_list(
-        "Rcyan", ["#DCEEF7", "#88CCEE"])     # pale cyan → Tol cyan (right)
+        "Rcyan", ["#DCEEF7", "#88CCEE"])
 
     def __init__(self, parent, exp_id: int, *,
                  rows: int = FULL_ROWS,
@@ -1494,11 +1629,35 @@ class FullViewPanel(tk.Frame):
         self.load_show = True       # Task V1
         self.load_lw   = 1.2        # Task LC27: half the old 2.4 default
 
+        # Titles / labels / fonts (Task L6-L10, LG21) — overwritten by apply_style().
+        self.title_tmpl     = "Box {n}"
+        self.xlabel_txt     = "time within hour"
+        self.ylabel_txt     = "Interval (hour)"
+        self.title_font     = "DejaVu Sans"
+        self.tick_font      = "DejaVu Sans"
+        self.legend_font    = "DejaVu Sans"
+        self.title_size     = 14
+        self.axislabel_size = 12
+        self.tick_size      = 11
+        self.legend_size    = 12
+
+        # Heatmap colour-bar config (Task HM15-HM19) — set by apply_heat().
+        self.heat_label_l  = "L Number of Licks / {bin}s bin"
+        self.heat_label_r  = "R Number of Licks / {bin}s bin"
+        self.heat_auto     = True
+        self.heat_vmin     = 1.0
+        self.heat_vmax     = 10.0
+        self.heat_ticks    = 5
+        self.heat_font     = "DejaVu Sans"
+        self.heat_title_size = 11
+        self.heat_tick_size  = 10
+        self._cmap_l = self._CMAP_L
+        self._cmap_r = self._CMAP_R
         self._fig = Figure(figsize=(10, 6.5), dpi=96, facecolor=BG)
         # Main raster (left, wide) + two slim colour-bar axes stacked on the right.
         gs = self._fig.add_gridspec(
             2, 2, width_ratios=[40, 1], height_ratios=[1, 1],
-            left=0.06, right=0.90, top=0.92, bottom=0.09,
+            left=0.06, right=0.90, top=0.85, bottom=0.09,
             hspace=0.45, wspace=0.04)
         self._ax    = self._fig.add_subplot(gs[:, 0])
         self._cax_l = self._fig.add_subplot(gs[0, 1])   # left-lick count bar
@@ -1512,6 +1671,37 @@ class FullViewPanel(tk.Frame):
     def cols(self) -> int:
         """Number of x-bins per row at the current row span / bin width."""
         return max(1, self.seconds_per_row // self.bin_seconds)
+
+    def apply_style(self, cfg: dict):
+        """Pull title/label/font settings from the visuals tab (Task L6-L10/LG21)."""
+        self.title_tmpl     = cfg.get("title_full", "Box {n}")
+        self.xlabel_txt     = cfg.get("xlabel_full", "time within hour")
+        self.ylabel_txt     = cfg.get("ylabel_full", "Interval (hour)")
+        self.title_font     = cfg.get("title_font", "DejaVu Sans")
+        self.tick_font      = cfg.get("tick_font", "DejaVu Sans")
+        self.legend_font    = cfg.get("legend_font", "DejaVu Sans")
+        self.title_size     = float(cfg.get("title_size_full", 14))
+        self.axislabel_size = float(cfg.get("axislabel_size_full", 12))
+        self.tick_size      = float(cfg.get("tick_size_full", 11))
+        self.legend_size    = float(cfg.get("legend_size_full", 12))
+
+    def apply_heat(self, cfg: dict):
+        """Pull heatmap label/scale/palette/font settings (Task HM15-HM19)."""
+        self.heat_label_l = cfg.get("heat_label_l", "L Number of Licks / {bin}s bin")
+        self.heat_label_r = cfg.get("heat_label_r", "R Number of Licks / {bin}s bin")
+        self.heat_auto    = bool(int(round(float(cfg.get("heat_auto", 1)))))
+        self.heat_vmin    = float(cfg.get("heat_vmin", 1))
+        self.heat_vmax    = float(cfg.get("heat_vmax", 10))
+        self.heat_ticks   = max(2, int(float(cfg.get("heat_ticks", 5))))
+        self.heat_font       = cfg.get("heat_font", "DejaVu Sans")
+        self.heat_title_size = float(cfg.get("heat_title_size", 11))
+        self.heat_tick_size  = float(cfg.get("heat_tick_size", 10))
+        pal = self.HEAT_PALETTES.get(cfg.get("heat_palette", "Tol muted"),
+                                     self.HEAT_PALETTES["Tol muted"])
+        light = float(cfg.get("heat_light", 0.85))
+        dark  = float(cfg.get("heat_dark", 0.0))
+        self._cmap_l = self._make_heat_cmap(pal["L"], light, dark)
+        self._cmap_r = self._make_heat_cmap(pal["R"], light, dark)
 
     def set_load_axis(self, ymin: float, ymax: float,
                       show: Optional[bool] = None,
@@ -1563,12 +1753,12 @@ class FullViewPanel(tk.Frame):
         return matL, matR
 
     @staticmethod
-    def _counts_to_rgba(mat, cmap, vmax):
-        """Map a count matrix through `cmap` so colour goes from faint (1 lick)
-        to saturated (`vmax` licks); empty bins are fully transparent. Returns an
+    def _counts_to_rgba(mat, cmap, vmin, vmax):
+        """Map a count matrix through `cmap` so colour goes from faint (`vmin`)
+        to saturated (`vmax`); empty bins are fully transparent. Returns an
         (rows, cols, 4) RGBA image so two such layers can be superimposed."""
-        denom = max(1e-9, float(vmax) - 1.0)
-        frac  = np.clip((mat - 1.0) / denom, 0.0, 1.0)   # 1 → 0.0, vmax → 1.0
+        denom = max(1e-9, float(vmax) - float(vmin))
+        frac  = np.clip((mat - float(vmin)) / denom, 0.0, 1.0)
         rgba  = cmap(frac)                               # (rows, cols, 4)
         rgba[..., 3] = np.where(mat > 0, 0.80, 0.0)      # transparent where empty
         return rgba
@@ -1594,18 +1784,27 @@ class FullViewPanel(tk.Frame):
         matL, matR = self.build_matrices(events, R, sec_row, bin_s)
         maxL = float(matL.max())
         maxR = float(matR.max())
-        for mat, cmap, mx in ((matL, self._CMAP_L, maxL),
-                              (matR, self._CMAP_R, maxR)):
+        # HM16: auto min/max from data, or the user's fixed manual range.
+        if self.heat_auto:
+            vmin_l, vmax_l = 1.0, max(maxL, 2.0)
+            vmin_r, vmax_r = 1.0, max(maxR, 2.0)
+        else:
+            vmin_l = vmin_r = self.heat_vmin
+            vmax_l = vmax_r = max(self.heat_vmax, self.heat_vmin + 1.0)
+        for mat, cmap, vmn, vmx, mx in (
+                (matL, self._cmap_l, vmin_l, vmax_l, maxL),
+                (matR, self._cmap_r, vmin_r, vmax_r, maxR)):
             if mx <= 0:
                 continue
-            rgba = self._counts_to_rgba(mat, cmap, max(mx, 2.0))
+            rgba = self._counts_to_rgba(mat, cmap, vmn, vmx)
             ax.imshow(rgba, extent=(0, C, R, 0), origin="upper",
                       aspect="auto", interpolation="nearest", zorder=2)
 
-        # ── Count colour-bars (the heat-map legends): faint = least-dense bin,
-        #    saturated = densest bin, ticks show the actual lick counts ────────
-        self._draw_count_bar(self._cax_l, self._CMAP_L, maxL, "L licks/bin")
-        self._draw_count_bar(self._cax_r, self._CMAP_R, maxR, "R licks/bin")
+        # ── Count colour-bars (the heat-map legends), Task HM15/HM17/HM18 ──────
+        self._draw_count_bar(self._cax_l, self._cmap_l, vmin_l, vmax_l,
+                             self.heat_label_l)
+        self._draw_count_bar(self._cax_r, self._cmap_r, vmin_r, vmax_r,
+                             self.heat_label_r)
 
         # ── Load-cell line plots (Task V1/LC24/LC25/LC27/LC28) ──────────────────
         # V1: only when enabled. LC24: zero-order-hold across the full row width.
@@ -1654,23 +1853,30 @@ class FullViewPanel(tk.Frame):
         ax.set_ylim(R, 0)
         self._canvas.draw_idle()
 
-    def _draw_count_bar(self, cax, cmap, maxcount, label):
-        """Draw a lick-count colour-bar on `cax` with ticks at the least-dense
-        (1) and densest (max) bin counts."""
+    def _draw_count_bar(self, cax, cmap, vmin, vmax, label_tmpl):
+        """Draw a lick-count colour-bar with configurable label/ticks/fonts.
+
+        Task HM15 (label, with "{bin}" → bin seconds), HM17 (more intensity ticks,
+        bigger numbers) and HM18 (font family + sizes from the visuals tab).
+        """
         cax.cla()
-        vmax = max(2.0, float(maxcount))
-        sm = ScalarMappable(norm=mcolors.Normalize(vmin=1, vmax=vmax), cmap=cmap)
+        vmin = float(vmin)
+        vmax = max(float(vmax), vmin + 1.0)
+        sm = ScalarMappable(norm=mcolors.Normalize(vmin=vmin, vmax=vmax),
+                            cmap=cmap)
         sm.set_array([])
         cb = self._fig.colorbar(sm, cax=cax)
-        # Ticks at the extremes the user asked about: least dense vs densest.
-        if maxcount >= 2:
-            ticks = sorted({1, int(round(maxcount))})
-        else:
-            ticks = [1]
+        # HM17: several intermediate ticks, not just the two extremes.
+        raw = np.linspace(vmin, vmax, self.heat_ticks)
+        ticks = sorted({int(round(t)) for t in raw})
         cb.set_ticks(ticks)
         cb.set_ticklabels([str(t) for t in ticks])
-        cb.set_label(label, color=FG, fontsize=7)
-        cax.tick_params(colors=FG_MUT, labelsize=7)
+        label = label_tmpl.replace("{bin}", str(self.bin_seconds))
+        cb.set_label(label, color=FG, fontsize=self.heat_title_size,
+                     fontfamily=self.heat_font)
+        cax.tick_params(colors=FG_MUT, labelsize=self.heat_tick_size)
+        for t in cax.get_yticklabels():
+            t.set_fontfamily(self.heat_font)
         cb.outline.set_edgecolor(BG_ALT)
 
     def _style_ax(self, ax, R: int, C: int):
@@ -1678,7 +1884,7 @@ class FullViewPanel(tk.Frame):
         ax.set_facecolor(BG_PNL)
         for sp in ax.spines.values():
             sp.set_color(BG_ALT)
-        ax.tick_params(colors=FG_MUT, labelsize=7)
+        ax.tick_params(colors=FG_MUT, labelsize=self.tick_size)
         ax.set_xlim(0, C)
         ax.set_ylim(R, 0)
 
@@ -1699,8 +1905,9 @@ class FullViewPanel(tk.Frame):
         ax.set_xticks(xt)
         ax.set_xticklabels(
             [f"{(x * self.bin_seconds / 60):g}" for x in xt],
-            fontsize=7, color=FG_MUT)
-        ax.set_xlabel("time within row (min)", fontsize=8, color=FG_MUT)
+            fontsize=self.tick_size, color=FG_MUT, fontfamily=self.tick_font)
+        ax.set_xlabel(self.xlabel_txt, fontsize=self.axislabel_size,
+                      color=FG_MUT, fontfamily=self.title_font)
 
         # Y ticks: one per row (capped), labelled by the row's start time.
         # LC28: one extra tick beyond the usual cap.
@@ -1708,11 +1915,15 @@ class FullViewPanel(tk.Frame):
         yt = sorted(set(np.linspace(0, R - 1, n_yt).round().astype(int).tolist()))
         ax.set_yticks([v + 0.5 for v in yt])
         ax.set_yticklabels([_fmt_hms(v * self.seconds_per_row) for v in yt],
-                           fontsize=7, color=FG_MUT)
-        ax.set_ylabel("row start", fontsize=8, color=FG_MUT)
+                           fontsize=self.tick_size, color=FG_MUT,
+                           fontfamily=self.tick_font)
+        ax.set_ylabel(self.ylabel_txt, fontsize=self.axislabel_size,
+                      color=FG_MUT, fontfamily=self.title_font)
 
-        ax.set_title(f"Box {self.exp_id} — licks (L rose / R cyan, intensity = "
-                     f"count) + load", fontsize=10, color=FG, loc="left", pad=4)
+        ax.set_title(self.title_tmpl.replace("{n}", str(self.exp_id)),
+                     fontsize=self.title_size, color=FG, loc="left", y=1.02,
+                     fontfamily=self.title_font)
+        # LG20/LG21: legend ABOVE the raster (its own row, above the title).
         ax.legend(
             handles=[
                 mpatches.Patch(color=CLR_L, label="L lick"),
@@ -1720,8 +1931,10 @@ class FullViewPanel(tk.Frame):
                 Line2D([0], [0], color=CLR_LOAD_L, linewidth=2.4, label="L load"),
                 Line2D([0], [0], color=CLR_LOAD_R, linewidth=2.4, label="R load"),
             ],
-            loc="upper right", fontsize=6, framealpha=0.30,
-            facecolor=BG_PNL, edgecolor=BG_ALT, labelcolor=FG, ncol=4)
+            loc="lower right", bbox_to_anchor=(1.0, 1.06), borderaxespad=0,
+            framealpha=0.30, facecolor=BG_PNL, edgecolor=BG_ALT,
+            labelcolor=FG, ncol=4,
+            prop={"family": self.legend_font, "size": self.legend_size})
 
     def save_png(self, path: str):
         """Save the full-view figure to a PNG file."""
@@ -2044,15 +2257,28 @@ class MainWindow(tk.Tk):
             return out
         return dict(self._settings["shared"]["flags"])
 
+    # Plot-settings keys whose values are text, not numbers (Task L6-L13/L9/LG21).
+    _PLOT_STR_KEYS = {
+        "title_full", "xlabel_full", "ylabel_full",
+        "title_monitor", "xlabel_monitor", "ylabel_monitor",
+        "title_font", "tick_font", "legend_font",
+        "heat_label_l", "heat_label_r", "heat_palette", "heat_font",
+    }
+
     def plot_settings(self) -> dict:
-        """Return current load-cell axis settings as a dict (reads live GUI vars if available)."""
+        """Return current plot settings as a dict (reads live GUI vars if available)."""
         if hasattr(self, "_plot_vars"):
             out = {}
+            defaults = self._settings["shared"]["plot"]
             for k, v in self._plot_vars.items():
+                if k in self._PLOT_STR_KEYS:
+                    val = v.get()
+                    out[k] = val if str(val).strip() else defaults.get(k, "")
+                    continue
                 try:
                     out[k] = float(v.get())
                 except (ValueError, tk.TclError):
-                    out[k] = self._settings["shared"]["plot"][k]
+                    out[k] = defaults[k]
             out["load_yticks"] = int(out["load_yticks"])
             if "load_show" in out:
                 out["load_show"] = int(round(out["load_show"]))
@@ -2150,13 +2376,14 @@ class MainWindow(tk.Tk):
                 for exp_id in running:
                     stem = os.path.join(folder, f"exp{exp_id}")
                     try:
-                        self._models[exp_id].export_npy(stem + "_eventlog.npy")
+                        self._models[exp_id].export_log(stem + "_eventlog")
                         fv = self._fullviews.get(exp_id)
                         if fv is not None:
                             fv.save_png(stem + "_raster.png")
                         self.emit_alert(exp_id,
-                                        f"autosaved → exp{exp_id}_eventlog.npy "
-                                        f"+ exp{exp_id}_raster.png", level="info")
+                                        f"autosaved → exp{exp_id}_eventlog"
+                                        f".npy/.csv + exp{exp_id}_raster.png",
+                                        level="info")
                     except Exception as e:
                         self.emit_alert(exp_id, f"autosave failed: {e}",
                                         level="error")
@@ -2207,6 +2434,7 @@ class MainWindow(tk.Tk):
                 seconds_per_row=fp["full_seconds_per_row"],
                 bin_seconds=fp["full_bin_seconds"])
             fv.pack(fill=tk.BOTH, expand=True)
+            fv.apply_style(self.plot_settings()); fv.apply_heat(self.plot_settings())
             self._fullviews[exp_id] = fv
 
         cal_tab   = tk.Frame(nb, bg=BG);  nb.add(cal_tab,   text="  Calibration  ")
@@ -2633,6 +2861,146 @@ class MainWindow(tk.Tk):
                    font=FONTM, bg=BG_ALT, fg=FG, relief=tk.FLAT
                    ).grid(row=1, column=1, sticky="w", padx=4)
 
+        # ── Titles, axis labels, fonts & legend (Task L6-L13, L9, L10, LG21) ──
+        FONT_CHOICES = ["DejaVu Sans", "DejaVu Serif", "DejaVu Sans Mono",
+                        "serif", "sans-serif", "monospace"]
+
+        def _strvar(key, default=""):
+            v = tk.StringVar(value=str(plot.get(key, default)))
+            self._plot_vars[key] = v
+            return v
+
+        def _text_row(parent, r, label, key):
+            tk.Label(parent, text=label, font=FONT, bg=BG_PNL, fg=FG
+                     ).grid(row=r, column=0, sticky="w", pady=4, padx=(0, 10))
+            tk.Entry(parent, textvariable=_strvar(key), width=26, font=FONTM,
+                     bg=BG_ALT, fg=FG, insertbackground=FG, relief=tk.FLAT
+                     ).grid(row=r, column=1, sticky="w", padx=4, columnspan=3)
+
+        def _size_row(parent, r, label, key_a, lab_a, key_b, lab_b):
+            tk.Label(parent, text=label, font=FONT, bg=BG_PNL, fg=FG
+                     ).grid(row=r, column=0, sticky="w", pady=4, padx=(0, 10))
+            tk.Label(parent, text=lab_a, font=FONT, bg=BG_PNL, fg=FG_MUT
+                     ).grid(row=r, column=1, sticky="e")
+            tk.Spinbox(parent, from_=4, to=48, increment=1, width=5, font=FONTM,
+                       textvariable=_strvar(key_a), bg=BG_ALT, fg=FG,
+                       relief=tk.FLAT).grid(row=r, column=2, sticky="w", padx=4)
+            tk.Label(parent, text=lab_b, font=FONT, bg=BG_PNL, fg=FG_MUT
+                     ).grid(row=r, column=3, sticky="e")
+            tk.Spinbox(parent, from_=4, to=48, increment=1, width=5, font=FONTM,
+                       textvariable=_strvar(key_b), bg=BG_ALT, fg=FG,
+                       relief=tk.FLAT).grid(row=r, column=4, sticky="w", padx=4)
+
+        tk.Label(body, text="Titles, axis labels, fonts & legend", font=FONTB,
+                 bg=BG, fg=FG).pack(anchor="w", padx=16, pady=(14, 1))
+        tk.Label(body, text="Rename plot titles and axis labels and set fonts "
+                 "and sizes. In a title, \"{n}\" is replaced by the box number, "
+                 "so \"Box {n}\" gives Box 1, Box 2, …  Applies on Apply & Save.",
+                 font=FONT, bg=BG, fg=FG_MUT, wraplength=900, justify="left"
+                 ).pack(anchor="w", padx=16, pady=(0, 4))
+        tf = tk.Frame(body, bg=BG_PNL, padx=16, pady=12)
+        tf.pack(fill=tk.X, padx=16, pady=(0, 4))
+
+        tk.Label(tf, text="Box (full-view) tabs", font=FONTB, bg=BG_PNL, fg=FG
+                 ).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 2))
+        _text_row(tf, 1, "Title (use {n}):", "title_full")
+        _text_row(tf, 2, "X-axis label:",    "xlabel_full")
+        _text_row(tf, 3, "Y-axis label:",    "ylabel_full")
+
+        tk.Label(tf, text="Monitor tab", font=FONTB, bg=BG_PNL, fg=FG
+                 ).grid(row=4, column=0, columnspan=5, sticky="w", pady=(10, 2))
+        _text_row(tf, 5, "Title (use {n}):", "title_monitor")
+        _text_row(tf, 6, "X-axis label:",    "xlabel_monitor")
+        _text_row(tf, 7, "Y-axis label:",    "ylabel_monitor")
+
+        tk.Label(tf, text="Font families", font=FONTB, bg=BG_PNL, fg=FG
+                 ).grid(row=8, column=0, columnspan=5, sticky="w", pady=(10, 2))
+        for r, (key, lab) in enumerate([("title_font", "Titles / axis labels:"),
+                                        ("tick_font", "Tick labels:"),
+                                        ("legend_font", "Legend:")], start=9):
+            tk.Label(tf, text=lab, font=FONT, bg=BG_PNL, fg=FG
+                     ).grid(row=r, column=0, sticky="w", pady=4, padx=(0, 10))
+            ttk.Combobox(tf, textvariable=_strvar(key, "DejaVu Sans"),
+                         values=FONT_CHOICES, width=22, font=FONTM,
+                         state="readonly"
+                         ).grid(row=r, column=1, columnspan=3, sticky="w", padx=4)
+
+        tk.Label(tf, text="Font sizes  (Box / Monitor)", font=FONTB,
+                 bg=BG_PNL, fg=FG).grid(row=12, column=0, columnspan=5,
+                                        sticky="w", pady=(10, 2))
+        _size_row(tf, 13, "Title:",      "title_size_full",     "Box",
+                  "title_size_monitor",     "Mon")
+        _size_row(tf, 14, "Axis labels:", "axislabel_size_full", "Box",
+                  "axislabel_size_monitor", "Mon")
+        _size_row(tf, 15, "Tick labels:", "tick_size_full",      "Box",
+                  "tick_size_monitor",      "Mon")
+        _size_row(tf, 16, "Legend:",      "legend_size_full",    "Box",
+                  "legend_size_monitor",    "Mon")
+
+        # ── Heatmap colour-bars (Box tabs) — Task HM15-HM19 ───────────────────
+        tk.Label(body, text="Heatmap colour-bars (Box tabs)", font=FONTB,
+                 bg=BG, fg=FG).pack(anchor="w", padx=16, pady=(14, 1))
+        tk.Label(body, text="Side labels, scale, colour-blind palette and fonts "
+                 "for the L/R lick-count colour-bars. In a label, \"{bin}\" is "
+                 "replaced by the bin size in seconds. Light/Dark set how pale "
+                 "the faint end and how deep the dense end of each bar are.",
+                 font=FONT, bg=BG, fg=FG_MUT, wraplength=900, justify="left"
+                 ).pack(anchor="w", padx=16, pady=(0, 4))
+        hf = tk.Frame(body, bg=BG_PNL, padx=16, pady=12)
+        hf.pack(fill=tk.X, padx=16, pady=(0, 4))
+
+        _text_row(hf, 0, "Left bar label:",  "heat_label_l")
+        _text_row(hf, 1, "Right bar label:", "heat_label_r")
+
+        tk.Checkbutton(hf, text="Auto min/max from data",
+                       variable=_strvar("heat_auto", 1),
+                       onvalue="1", offvalue="0", font=FONT, bg=BG_PNL, fg=FG,
+                       selectcolor=BG_ALT, activebackground=BG_PNL,
+                       activeforeground=FG
+                       ).grid(row=2, column=0, sticky="w", pady=(8, 4))
+        tk.Label(hf, text="Manual min:", font=FONT, bg=BG_PNL, fg=FG_MUT
+                 ).grid(row=2, column=1, sticky="e")
+        tk.Spinbox(hf, from_=0, to=9999, increment=1, width=6, font=FONTM,
+                   textvariable=_strvar("heat_vmin", 1), bg=BG_ALT, fg=FG,
+                   relief=tk.FLAT).grid(row=2, column=2, sticky="w", padx=4)
+        tk.Label(hf, text="max:", font=FONT, bg=BG_PNL, fg=FG_MUT
+                 ).grid(row=2, column=3, sticky="e")
+        tk.Spinbox(hf, from_=1, to=9999, increment=1, width=6, font=FONTM,
+                   textvariable=_strvar("heat_vmax", 10), bg=BG_ALT, fg=FG,
+                   relief=tk.FLAT).grid(row=2, column=4, sticky="w", padx=4)
+
+        tk.Label(hf, text="Intensity ticks:", font=FONT, bg=BG_PNL, fg=FG
+                 ).grid(row=3, column=0, sticky="w", pady=4)
+        tk.Spinbox(hf, from_=2, to=20, increment=1, width=6, font=FONTM,
+                   textvariable=_strvar("heat_ticks", 5), bg=BG_ALT, fg=FG,
+                   relief=tk.FLAT).grid(row=3, column=1, sticky="w", padx=4)
+
+        tk.Label(hf, text="Palette (colour-blind safe):", font=FONT,
+                 bg=BG_PNL, fg=FG).grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Combobox(hf, textvariable=_strvar("heat_palette", "Tol muted"),
+                     values=list(FullViewPanel.HEAT_PALETTES.keys()),
+                     width=20, font=FONTM, state="readonly"
+                     ).grid(row=4, column=1, columnspan=3, sticky="w", padx=4)
+
+        tk.Label(hf, text="Light end (0–1):", font=FONT, bg=BG_PNL, fg=FG
+                 ).grid(row=5, column=0, sticky="w", pady=4)
+        tk.Spinbox(hf, from_=0, to=1, increment=0.05, width=6, font=FONTM,
+                   textvariable=_strvar("heat_light", 0.85), bg=BG_ALT, fg=FG,
+                   relief=tk.FLAT).grid(row=5, column=1, sticky="w", padx=4)
+        tk.Label(hf, text="Dark end (0–1):", font=FONT, bg=BG_PNL, fg=FG_MUT
+                 ).grid(row=5, column=2, sticky="e")
+        tk.Spinbox(hf, from_=0, to=1, increment=0.05, width=6, font=FONTM,
+                   textvariable=_strvar("heat_dark", 0.0), bg=BG_ALT, fg=FG,
+                   relief=tk.FLAT).grid(row=5, column=3, sticky="w", padx=4)
+
+        tk.Label(hf, text="Bar font:", font=FONT, bg=BG_PNL, fg=FG
+                 ).grid(row=6, column=0, sticky="w", pady=4)
+        ttk.Combobox(hf, textvariable=_strvar("heat_font", "DejaVu Sans"),
+                     values=FONT_CHOICES, width=18, font=FONTM, state="readonly"
+                     ).grid(row=6, column=1, columnspan=2, sticky="w", padx=4)
+        _size_row(hf, 7, "Bar font sizes:", "heat_title_size", "Title",
+                  "heat_tick_size", "Ticks")
+
         section("Monitor raster timing", "Controls the live 4-row quadrant view "
                 "on the Monitor tab (also settable at the top of the script).",
                 self._monitor_vars, [
@@ -2764,6 +3132,7 @@ class MainWindow(tk.Tk):
         show = bool(pv.get("load_show", 1))
         lw   = float(pv.get("load_linewidth", 1.2))
         for exp_id, fv in getattr(self, "_fullviews", {}).items():
+            fv.apply_style(pv); fv.apply_heat(pv)
             fv.reconfigure(fp["full_rows"], fp["full_seconds_per_row"],
                            fp["full_bin_seconds"])
             fv.set_load_axis(pv["load_ymin"], pv["load_ymax"],
@@ -3016,8 +3385,11 @@ class MainWindow(tk.Tk):
         """Validate and apply ALL Raster Plot Visuals settings: load-cell axis,
         monitor raster timing, and full-view grid geometry."""
         vals = {}
-        # ── Load-cell axis (floats) ──────────────────────────────────────────
+        # ── Load-cell axis (floats) + titles/labels/fonts (text) ─────────────
         for k, v in self._plot_vars.items():
+            if k in self._PLOT_STR_KEYS:            # titles / labels / fonts
+                vals[k] = v.get()
+                continue
             try:
                 vals[k] = float(v.get())
             except ValueError:
@@ -3061,6 +3433,7 @@ class MainWindow(tk.Tk):
         show = bool(vals.get("load_show", 1))
         lw   = float(vals.get("load_linewidth", 1.2))
         for exp_id, fv in self._fullviews.items():
+            fv.apply_style(vals); fv.apply_heat(vals)
             fv.reconfigure(fp["full_rows"], fp["full_seconds_per_row"],
                            fp["full_bin_seconds"])
             fv.set_load_axis(vals["load_ymin"], vals["load_ymax"],
