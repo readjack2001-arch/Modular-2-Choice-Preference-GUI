@@ -76,7 +76,7 @@ try:
 except NameError:
     _HERE = os.getcwd()
 
-DEFAULT_GUI = os.path.join(_HERE, "lickometer_finalx7.py")
+DEFAULT_GUI = os.path.join(_HERE, "lickometer_finalx6.py")
 # Common Arduino board fully-qualified board names for the upload step.
 COMMON_FQBN = [
     "arduino:avr:mega",
