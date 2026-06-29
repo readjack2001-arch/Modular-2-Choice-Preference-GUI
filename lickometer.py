@@ -128,6 +128,9 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.colors as mcolors
+from matplotlib.lines import Line2D
+from matplotlib.cm import ScalarMappable
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import numpy as np
@@ -1019,13 +1022,18 @@ class RasterPanel:
             sp.set_color(BG_ALT)
         ax.tick_params(colors=FG_MUT, labelsize=6)
 
-        step     = max(1, 10_000 // tb)
+        # X axis labelled in MINUTES (tick spacing snapped to a nice value).
+        row_s = self.seconds_per_row
+        nice_s = [15, 30, 60, 120, 300, 600, 900, 1800, 3600]
+        target = max(1.0, row_s / 8.0)
+        tick_s = min(nice_s, key=lambda v: abs(v - target))
+        step   = max(1, int(round((tick_s * 1000) / tb)))   # bins per tick
         x_ticks  = np.arange(0, bpr + 1, step)
-        x_labels = [str(int(t * tb / 1000)) for t in x_ticks]
+        x_labels = [f"{(t * tb / 60000):g}" for t in x_ticks]   # bins → minutes
         ax.set_xticks(x_ticks)
         ax.set_xticklabels(x_labels, fontsize=6, color=FG_MUT)
         ax.set_xlim(0, bpr)
-        ax.set_xlabel("s", fontsize=6, color=FG_MUT, labelpad=1)
+        ax.set_xlabel("min", fontsize=6, color=FG_MUT, labelpad=1)
 
         # Inverted y so the earliest visible row is at the TOP.
         ax.set_ylim(n_disp, 0)
@@ -1277,41 +1285,54 @@ class ExpQuadrant(tk.Frame):
             self._status.set(f"● {el:.0f} s")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FULL-VIEW PANEL  (one tab per experiment — whole-experiment imshow heat-map)
+# FULL-VIEW PANEL  (one tab per experiment — whole-experiment superimposed raster)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Unlike the monitor raster, this view is a FIXED-SIZE image of the entire
-# experiment (default 24 rows × 3600 s/row = 24 h) drawn with imshow on coarse
-# bins (default 60 s → 60 bins/row). It does not grow or scroll: the grid is
-# allocated up front and bins are filled in from the in-memory event log every
-# X minutes. Bins with no licks stay at 0 (background); any bin with ≥1 lick is
-# coloured, and colour ENCODES COUNT (darker/brighter = more licks) with a
-# colour-bar legend. Left and right spouts are shown as two stacked heat-maps.
+# A FIXED-SIZE view of the entire experiment (default 24 rows × 3600 s/row) in a
+# SINGLE raster. Left and right licks are superimposed as two count heat-maps in
+# their own colours (left = red, right = blue, matching the monitor tab); colour
+# intensity (alpha) encodes the lick count per coarse bin. On top of the licks,
+# each load cell is drawn as a translucent shaded line plot in the matching
+# colour, exactly like the monitor quadrants. All 24 rows hold the full data set
+# overlaid — there are NOT two separate sub-plots.
 
 class FullViewPanel(tk.Frame):
-    """Whole-experiment imshow heat-map (left + right lick counts) for one exp."""
+    """Whole-experiment raster: superimposed L/R lick heat-maps (left = red,
+    right = blue, colour intensity = lick count, each with its own count
+    colour-bar) plus offset load-cell line plots (left = green, right = black)."""
 
-    _CMAP_NAME = "magma"
+    # Sequential colormaps: faint (least-dense bin) → saturated (densest bin).
+    _CMAP_L = mcolors.LinearSegmentedColormap.from_list(
+        "Lred",  ["#F4B6B6", "#FF0000"])     # very-less red → all-the-way red
+    _CMAP_R = mcolors.LinearSegmentedColormap.from_list(
+        "Rblue", ["#B6C8F4", "#0000FF"])     # very-less blue → all-the-way blue
 
     def __init__(self, parent, exp_id: int, *,
                  rows: int = FULL_ROWS,
                  seconds_per_row: int = FULL_SECONDS_PER_ROW,
                  bin_seconds: int = FULL_BIN_SECONDS):
-        """Build a fixed-size, two-panel (L/R) heat-map filling the tab."""
+        """Build the main raster axis plus two lick-count colour-bars."""
         super().__init__(parent, bg=BG)
         self.exp_id          = exp_id
         self.rows            = max(1, int(rows))
         self.seconds_per_row = max(1, int(seconds_per_row))
         self.bin_seconds     = max(1, int(bin_seconds))
+        # Load-cell gram axis (pushed in from the Raster Plot Visuals tab so the
+        # load line plots use the same scale as the monitor quadrants).
+        self.load_ymin = LOAD_YMIN
+        self.load_ymax = LOAD_YMAX
 
         self._fig = Figure(figsize=(10, 6.5), dpi=96, facecolor=BG)
+        # Main raster (left, wide) + two slim colour-bar axes stacked on the right.
+        gs = self._fig.add_gridspec(
+            2, 2, width_ratios=[40, 1], height_ratios=[1, 1],
+            left=0.06, right=0.90, top=0.92, bottom=0.09,
+            hspace=0.45, wspace=0.04)
+        self._ax    = self._fig.add_subplot(gs[:, 0])
+        self._cax_l = self._fig.add_subplot(gs[0, 1])   # left-lick count bar
+        self._cax_r = self._fig.add_subplot(gs[1, 1])   # right-lick count bar
         self._canvas = FigureCanvasTkAgg(self._fig, master=self)
         self._canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-        self._im_l = None
-        self._im_r = None
-        self._cbar = None
-        self._build_axes()
         self.update_view([])
 
     # ── geometry ────────────────────────────────────────────────────────────────
@@ -1320,13 +1341,24 @@ class FullViewPanel(tk.Frame):
         """Number of x-bins per row at the current row span / bin width."""
         return max(1, self.seconds_per_row // self.bin_seconds)
 
+    def set_load_axis(self, ymin: float, ymax: float):
+        """Set the gram limits used to normalise the load-cell line plots."""
+        self.load_ymin = ymin
+        self.load_ymax = ymax
+
+    def reconfigure(self, rows: int, seconds_per_row: int, bin_seconds: int):
+        """Change the grid geometry. Picked up on the next update_view()."""
+        self.rows            = max(1, int(rows))
+        self.seconds_per_row = max(1, int(seconds_per_row))
+        self.bin_seconds     = max(1, int(bin_seconds))
+
     @staticmethod
     def build_matrices(events, rows, seconds_per_row, bin_seconds):
         """Return (left_counts, right_counts) matrices of shape (rows, cols).
 
-        Each lick ONSET is binned by its elapsed time. A bin holds the NUMBER of
-        licks that fell in it, so colour can encode count. Events past the end of
-        the grid are clamped into the final bin rather than dropped.
+        Each lick ONSET is binned by its elapsed time; a bin holds the NUMBER of
+        licks that fell in it, so colour intensity can encode count. Events past
+        the end of the grid are clamped into the final bin rather than dropped.
         """
         cols = max(1, seconds_per_row // bin_seconds)
         matL = np.zeros((rows, cols), dtype=np.float64)
@@ -1352,86 +1384,149 @@ class FullViewPanel(tk.Frame):
             mat[r, c] += 1
         return matL, matR
 
-    # ── building / configuring axes ─────────────────────────────────────────────
-    def _build_axes(self):
-        """Lay out the two stacked heat-maps and the shared colour-bar."""
-        self._fig.clf()
-        # Two stacked image axes + a slim colour-bar axis on the right.
-        gs = self._fig.add_gridspec(
-            2, 2, width_ratios=[40, 1], height_ratios=[1, 1],
-            left=0.05, right=0.93, top=0.93, bottom=0.07,
-            hspace=0.22, wspace=0.03)
-        self._ax_l = self._fig.add_subplot(gs[0, 0])
-        self._ax_r = self._fig.add_subplot(gs[1, 0])
-        self._cax  = self._fig.add_subplot(gs[:, 1])
+    @staticmethod
+    def _counts_to_rgba(mat, cmap, vmax):
+        """Map a count matrix through `cmap` so colour goes from faint (1 lick)
+        to saturated (`vmax` licks); empty bins are fully transparent. Returns an
+        (rows, cols, 4) RGBA image so two such layers can be superimposed."""
+        denom = max(1e-9, float(vmax) - 1.0)
+        frac  = np.clip((mat - 1.0) / denom, 0.0, 1.0)   # 1 → 0.0, vmax → 1.0
+        rgba  = cmap(frac)                               # (rows, cols, 4)
+        rgba[..., 3] = np.where(mat > 0, 0.80, 0.0)      # transparent where empty
+        return rgba
 
-        cmap = plt.get_cmap(self._CMAP_NAME).copy()
-        cmap.set_bad(BG_PNL)        # masked (zero-lick) bins → background colour
+    # ── data update / draw ──────────────────────────────────────────────────────
+    def update_view(self, events):
+        """Redraw the whole-experiment raster from `events`."""
+        ax = self._ax
+        ax.cla()
+        R, C = self.rows, self.cols
+        sec_row = self.seconds_per_row
+        bin_s   = self.bin_seconds
 
-        cols = self.cols
-        blank_l = np.ma.masked_all((self.rows, cols))
-        blank_r = np.ma.masked_all((self.rows, cols))
+        self._style_ax(ax, R, C)
 
-        for ax, blank, title, im_attr in (
-                (self._ax_l, blank_l, f"Exp {self.exp_id} — LEFT licks",  "_im_l"),
-                (self._ax_r, blank_r, f"Exp {self.exp_id} — RIGHT licks", "_im_r")):
-            im = ax.imshow(blank, aspect="auto", cmap=cmap,
-                           vmin=1, vmax=2, interpolation="nearest",
-                           origin="upper")
-            setattr(self, im_attr, im)
-            self._style_ax(ax, title)
+        # Alternating row backgrounds for readability.
+        for r in range(R):
+            if r % 2 == 1:
+                ax.axhspan(r, r + 1, color=BG_ALT, zorder=0, linewidth=0)
 
-        self._cbar = self._fig.colorbar(self._im_r, cax=self._cax)
-        self._cbar.set_label("licks per bin", color=FG, fontsize=8)
-        self._cax.tick_params(colors=FG_MUT, labelsize=7)
-        self._cbar.outline.set_edgecolor(BG_ALT)
+        # ── Superimposed lick heat-maps: left red, right blue, each scaled to
+        #    its OWN max count so its colour-bar reads that side's range ────────
+        matL, matR = self.build_matrices(events, R, sec_row, bin_s)
+        maxL = float(matL.max())
+        maxR = float(matR.max())
+        for mat, cmap, mx in ((matL, self._CMAP_L, maxL),
+                              (matR, self._CMAP_R, maxR)):
+            if mx <= 0:
+                continue
+            rgba = self._counts_to_rgba(mat, cmap, max(mx, 2.0))
+            ax.imshow(rgba, extent=(0, C, R, 0), origin="upper",
+                      aspect="auto", interpolation="nearest", zorder=2)
 
-    def _style_ax(self, ax, title: str):
-        """Apply theme styling + time tick labels to one heat-map axis."""
+        # ── Count colour-bars (the heat-map legends): faint = least-dense bin,
+        #    saturated = densest bin, ticks show the actual lick counts ────────
+        self._draw_count_bar(self._cax_l, self._CMAP_L, maxL, "L licks/bin")
+        self._draw_count_bar(self._cax_r, self._CMAP_R, maxR, "R licks/bin")
+
+        # ── Load-cell line plots: left = green, right = black, slightly offset
+        #    vertically from each other; thick line, no shaded fill ────────────
+        span = self.load_ymax - self.load_ymin
+        if span > 0:
+            for load_eid, color, dy in ((_L_LOAD, CLR_GRN, +0.06),
+                                        (_R_LOAD, "#000000", -0.06)):
+                by_row: Dict[int, List[Tuple[float, float]]] = {}
+                for e in events:
+                    if e.event_id != load_eid:
+                        continue
+                    t_s = e.timestamp_ms / 1000.0
+                    r = int(t_s // sec_row)
+                    if r < 0 or r >= R:
+                        continue
+                    x = (t_s % sec_row) / bin_s                 # column units
+                    nval = min(max((e.amplitude - self.load_ymin) / span,
+                                   0.0), 1.0)
+                    by_row.setdefault(r, []).append((x, nval))
+                for r, pts in by_row.items():
+                    if len(pts) < 2:
+                        continue
+                    pts.sort()
+                    xs = np.array([p[0] for p in pts])
+                    # centre the trace in the row band and add the per-side
+                    # offset so the two lines don't sit on top of each other
+                    ys = r + 0.18 + np.array([p[1] for p in pts]) * 0.6 + dy
+                    ax.plot(xs, ys, color=color, alpha=0.9,
+                            linewidth=2.4, zorder=4)
+
+        # Re-assert limits (imshow can otherwise rescale them).
+        ax.set_xlim(0, C)
+        ax.set_ylim(R, 0)
+        self._canvas.draw_idle()
+
+    def _draw_count_bar(self, cax, cmap, maxcount, label):
+        """Draw a lick-count colour-bar on `cax` with ticks at the least-dense
+        (1) and densest (max) bin counts."""
+        cax.cla()
+        vmax = max(2.0, float(maxcount))
+        sm = ScalarMappable(norm=mcolors.Normalize(vmin=1, vmax=vmax), cmap=cmap)
+        sm.set_array([])
+        cb = self._fig.colorbar(sm, cax=cax)
+        # Ticks at the extremes the user asked about: least dense vs densest.
+        if maxcount >= 2:
+            ticks = sorted({1, int(round(maxcount))})
+        else:
+            ticks = [1]
+        cb.set_ticks(ticks)
+        cb.set_ticklabels([str(t) for t in ticks])
+        cb.set_label(label, color=FG, fontsize=7)
+        cax.tick_params(colors=FG_MUT, labelsize=7)
+        cb.outline.set_edgecolor(BG_ALT)
+
+    def _style_ax(self, ax, R: int, C: int):
+        """Theme + axes labels: x in minutes within a row, y by row-start time."""
         ax.set_facecolor(BG_PNL)
         for sp in ax.spines.values():
             sp.set_color(BG_ALT)
-        ax.set_title(title, fontsize=10, color=FG, loc="left", pad=4)
         ax.tick_params(colors=FG_MUT, labelsize=7)
+        ax.set_xlim(0, C)
+        ax.set_ylim(R, 0)
 
-        cols = self.cols
-        # X ticks: a handful across the row, labelled in minutes from row start.
-        n_xt = min(cols, 7)
-        xt = np.linspace(0, cols - 1, n_xt)
+        # X ticks labelled in MINUTES from the start of each row.
+        row_s  = self.seconds_per_row
+        nice_s = [15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200]
+        target = max(1.0, row_s / 6.0)
+        tick_s = min(nice_s, key=lambda v: abs(v - target))
+        xt, i = [], 0
+        while (i * tick_s) <= row_s:
+            xpos = (i * tick_s) / self.bin_seconds
+            if xpos <= C:
+                xt.append(xpos)
+            i += 1
         ax.set_xticks(xt)
         ax.set_xticklabels(
-            [f"{int(round(t)) * self.bin_seconds // 60} min" for t in xt],
+            [f"{(x * self.bin_seconds / 60):g}" for x in xt],
             fontsize=7, color=FG_MUT)
-        ax.set_xlabel("time within row", fontsize=8, color=FG_MUT)
+        ax.set_xlabel("time within row (min)", fontsize=8, color=FG_MUT)
 
         # Y ticks: one per row (capped), labelled by the row's start time.
-        n_yt = min(self.rows, 12)
-        yt = np.linspace(0, self.rows - 1, n_yt).round().astype(int)
-        yt = sorted(set(yt.tolist()))
-        ax.set_yticks(yt)
-        ax.set_yticklabels(
-            [_fmt_hms(r * self.seconds_per_row) for r in yt],
-            fontsize=7, color=FG_MUT)
+        n_yt = min(R, 12)
+        yt = sorted(set(np.linspace(0, R - 1, n_yt).round().astype(int).tolist()))
+        ax.set_yticks([v + 0.5 for v in yt])
+        ax.set_yticklabels([_fmt_hms(v * self.seconds_per_row) for v in yt],
+                           fontsize=7, color=FG_MUT)
         ax.set_ylabel("row start", fontsize=8, color=FG_MUT)
 
-    def reconfigure(self, rows: int, seconds_per_row: int, bin_seconds: int):
-        """Change the grid geometry (rebuilds the images) and redraw."""
-        self.rows            = max(1, int(rows))
-        self.seconds_per_row = max(1, int(seconds_per_row))
-        self.bin_seconds     = max(1, int(bin_seconds))
-        self._build_axes()
-
-    # ── data update ─────────────────────────────────────────────────────────────
-    def update_view(self, events):
-        """Rebuild the count matrices from `events` and refresh the images."""
-        matL, matR = self.build_matrices(
-            events, self.rows, self.seconds_per_row, self.bin_seconds)
-        vmax = max(2.0, float(matL.max()), float(matR.max()))
-        for im, mat in ((self._im_l, matL), (self._im_r, matR)):
-            masked = np.ma.masked_where(mat <= 0, mat)
-            im.set_data(masked)
-            im.set_clim(1, vmax)
-        self._canvas.draw_idle()
+        ax.set_title(f"Exp {self.exp_id} — licks (L red / R blue, intensity = "
+                     f"count) + load", fontsize=10, color=FG, loc="left", pad=4)
+        ax.legend(
+            handles=[
+                mpatches.Patch(color="#FF0000", label="L lick"),
+                mpatches.Patch(color="#0000FF", label="R lick"),
+                Line2D([0], [0], color=CLR_GRN,   linewidth=2.4, label="L load"),
+                Line2D([0], [0], color="#000000", linewidth=2.4, label="R load"),
+            ],
+            loc="upper right", fontsize=6, framealpha=0.30,
+            facecolor=BG_PNL, edgecolor=BG_ALT, labelcolor=FG, ncol=4)
 
     def save_png(self, path: str):
         """Save the full-view figure to a PNG file."""
@@ -2281,11 +2376,13 @@ class MainWindow(tk.Tk):
         """Populate all GUI widgets from the settings loaded at startup (Task 3 round-trip)."""
         for q in self._quadrants:
             q.apply_plot_settings()
-        # Full-view tabs: apply loaded geometry, then paint from in-memory logs.
+        # Full-view tabs: apply loaded geometry + load axis, then paint logs.
         fp = self.full_settings()
+        pv = self.plot_settings()
         for exp_id, fv in getattr(self, "_fullviews", {}).items():
             fv.reconfigure(fp["full_rows"], fp["full_seconds_per_row"],
                            fp["full_bin_seconds"])
+            fv.set_load_axis(pv["load_ymin"], pv["load_ymax"])
             fv.update_view(self._models[exp_id].get_log())
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -2504,11 +2601,12 @@ class MainWindow(tk.Tk):
         for q in self._quadrants:                        # Task 2/5
             q.apply_plot_settings()
 
-        # Live reconfigure: full-view tabs get the new grid + a repaint.
+        # Live reconfigure: full-view tabs get the new grid + load axis + repaint.
         fp = self.full_settings()                        # Task 3
         for exp_id, fv in self._fullviews.items():
             fv.reconfigure(fp["full_rows"], fp["full_seconds_per_row"],
                            fp["full_bin_seconds"])
+            fv.set_load_axis(vals["load_ymin"], vals["load_ymax"])
             fv.update_view(self._models[exp_id].get_log())
 
         self.emit_alert(None, "raster plot visuals updated", level="info")
