@@ -2248,6 +2248,15 @@ class MainWindow(tk.Tk):
         self._last_raw:  Dict[int, float] = {}   # {arduino_id: last_amp}
         self._cal_buf:   Dict[int, list]  = {}   # {load_id: [(ts_ms, grams), ...]} live feed
         self._snaps:     Dict[tuple, float] = {} # {(load_id, "50g"|"bottle"): val}
+        # ── Freshness gate (replaces the old variance/stability gate) ──────────
+        # A snap is allowed only once a cell has streamed fresh readings AT the
+        # currently-placed load. We count readings per cell and re-anchor the count
+        # whenever the value STEPS (a weight is placed/removed), so a snap can't
+        # capture a stale pre-placement value even though the load feed is slow.
+        self._cal_count:    Dict[int, int]   = {}  # {load_id: total load readings seen}
+        self._fresh_anchor: Dict[int, int]   = {}  # {load_id: count at last step (settling start)}
+        self._prev_val:     Dict[int, float] = {}  # {load_id: previous reading (step detection)}
+        self._fresh_step_cached: float = 0.5       # g; step that re-anchors freshness (thread-safe copy)
         # The Arduino now streams load cells continuously (≈ LOADCELL_PERIOD_MS).
         # The "weight interval" is applied HERE, in Python: during the experiment
         # each load channel is recorded into its model only once per interval, so
@@ -2850,14 +2859,15 @@ class MainWindow(tk.Tk):
         # ── Calibration controls (snap = tell the Arduino to calibrate) ───────
         ctl = section(
             "Load-cell calibration",
-            "For each cell, wait until its monitor shows a STABLE reading, then:\n"
+            "For each cell, place the load and wait until its monitor shows the "
+            "reading has REFRESHED at that load, then:\n"
             "  • Empty bottle on the cell  → Snap Bottle  (Arduino OFFSET cal)\n"
             "  • 50 g weight on the cell   → Snap 50 g    (Arduino GAIN cal)\n"
-            "Snaps unlock only once that cell has settled; gain is locked until "
-            "its offset is done. (Make cells empty, then bottles, then 50 g.)")
+            "Snaps unlock once the cell has streamed a few new readings since the "
+            "load changed; gain is locked until its offset is done. "
+            "(Make cells empty, then bottles, then 50 g.)")
 
         self._offset_done: set = set()
-        self._snap_armed: set = set()    # latched (load_id, stage) ready-to-snap
         self._snap_btns: Dict[tuple, object] = {}
         self._cal_cells: list = []
         self._cal_present_g = 0.5
@@ -2878,19 +2888,19 @@ class MainWindow(tk.Tk):
                        width=6, font=FONTM, bg=BG_ALT, fg=FG, relief=tk.FLAT
                        ).pack(side=tk.LEFT, padx=(0, 14))
         self._cal_delay_var   = tk.StringVar(value="5")
-        self._cal_thresh_var  = tk.StringVar(value="0.1")
-        self._cal_varthresh_var = tk.StringVar(value="0.1")
         self._cal_present_var = tk.StringVar(value="0.5")
-        # Stability is judged over the last N load-cell READINGS, not seconds:
-        # the load feed is fast and continuous but round-robins 8 channels, so a
-        # given cell refreshes every ~8·LOADCELL_PERIOD_MS. Counting readings
-        # keeps the gate aligned with the monitor at whatever the cell rate is.
-        self._cal_nsamp_var   = tk.StringVar(value="3")
-        param("Stability window (samples):", self._cal_nsamp_var,   2, 50,  1)
-        param("Variance thresh (g²):",      self._cal_varthresh_var, 0.0, 50, 0.0005)
-        param("Monitor span (s):",          self._cal_delay_var,    0.5, 600, 0.5)
-        param("Gram-spread thresh (g):",    self._cal_thresh_var,   0.001, 50, 0.01)
-        param("Weight-present min (g):",    self._cal_present_var,  0, 100, 0.1)
+        # Freshness, not stability: a snap unlocks once the cell has streamed
+        # `Fresh samples required` NEW readings since its value last STEPPED (i.e.
+        # since a weight was placed/removed). Counted in READINGS, not seconds,
+        # because the load feed round-robins 8 channels and can be slow. This only
+        # guarantees the cell has refreshed at the current load before the snap —
+        # it does NOT require the reading to be flat/low-variance.
+        self._cal_nsamp_var   = tk.StringVar(value="2")
+        self._cal_step_var    = tk.StringVar(value="0.5")
+        param("Fresh samples required:",  self._cal_nsamp_var,   1, 50,  1)
+        param("Step threshold (g):",      self._cal_step_var,    0.01, 50, 0.05)
+        param("Monitor span (s):",        self._cal_delay_var,   0.5, 600, 0.5)
+        param("Weight-present min (g):",  self._cal_present_var, 0, 100, 0.1)
         self._weight_present_var = tk.StringVar(value="1")
         tk.Checkbutton(
             pf, variable=self._weight_present_var, onvalue="1", offvalue="0",
@@ -2915,29 +2925,9 @@ class MainWindow(tk.Tk):
                             "averages it, so a single jump can't skew it)",
                  font=FONT, bg=BG_PNL, fg=FG_MUT).pack(side=tk.LEFT, padx=8)
 
-        # Display-mode toggle for the per-cell monitors.
-        df = tk.Frame(ctl, bg=BG_PNL); df.pack(fill=tk.X, pady=(0, 4))
-        tk.Label(df, text="Monitors show:", font=FONT, bg=BG_PNL, fg=FG
-                 ).pack(side=tk.LEFT, padx=(0, 6))
-        self._cal_disp_var = tk.StringVar(value="raw")
-        for val, lbl in (("raw", "Raw / reported values"),
-                         ("var", "Moving variance")):
-            tk.Radiobutton(df, variable=self._cal_disp_var, value=val, text=lbl,
-                           font=FONT, bg=BG_PNL, fg=FG, selectcolor=BG_ALT,
-                           activebackground=BG_PNL, activeforeground=FG
-                           ).pack(side=tk.LEFT, padx=(0, 10))
-
-        # Stability-GATE metric toggle (what the snap unlock is judged on).
-        mf = tk.Frame(ctl, bg=BG_PNL); mf.pack(fill=tk.X, pady=(0, 4))
-        tk.Label(mf, text="Stability judged by:", font=FONT, bg=BG_PNL, fg=FG
-                 ).pack(side=tk.LEFT, padx=(0, 6))
-        self._cal_metric_var = tk.StringVar(value="var")   # variance by default
-        for val, lbl in (("var",  "Moving variance (g²)"),
-                         ("gram", "Gram spread (g)")):
-            tk.Radiobutton(mf, variable=self._cal_metric_var, value=val, text=lbl,
-                           font=FONT, bg=BG_PNL, fg=FG, selectcolor=BG_ALT,
-                           activebackground=BG_PNL, activeforeground=FG
-                           ).pack(side=tk.LEFT, padx=(0, 10))
+        # Monitors always show raw/reported grams now; the moving-variance display
+        # and the variance/gram stability gate were removed in favour of the
+        # freshness gate (above). Nothing to toggle.
 
         # Per-cell monitors: one stacked sub-plot per load cell, sharing ONE
         # x-axis (time) for the whole figure but each with its OWN y-axis.
@@ -2994,10 +2984,10 @@ class MainWindow(tk.Tk):
                 b.grid(row=r, column=4 + ci * 2, padx=2)
                 self._snap_btns[(exp_id, side, kind)] = b
                 # NOT added to _cal_lock_buttons: the per-cell snaps are governed
-                # solely by stability + latch in _cal_tick, so the init lockout
-                # can't keep a stable cell's button disabled.
+                # solely by the freshness gate in _cal_tick, so the init lockout
+                # can't keep a refreshed cell's button disabled.
 
-            stv = tk.StringVar(value="waiting for stable weight…")
+            stv = tk.StringVar(value="waiting for fresh reading…")
             self._snap_svars[(exp_id, side, "status")] = stv
             tk.Label(grid, textvariable=stv, font=FONTM, bg=BG_PNL,
                      fg=CLR_GRN, width=26
@@ -3685,7 +3675,7 @@ class MainWindow(tk.Tk):
         arriving for it (≥2 readings). We deliberately do NOT require the
         stability metric here: initialization confirms the stream is live, not
         that the weights have settled. Per-cell settling for calibration is
-        judged separately by the snap-stability gate (_cell_stable)."""
+        judged separately by the snap-freshness gate (_cell_fresh)."""
         return len(self._cal_buf.get(int(load_id), [])) >= 2
 
     def _check_init_stable(self):
@@ -3755,102 +3745,53 @@ class MainWindow(tk.Tk):
         save_port_section(self._reader.port, "thresholds", {str(ch): n})
 
     def _cal_params(self):
-        """Stability delay (s), gram threshold (g) and weight-present threshold
-        (g) from the calibration tab, with safe fallbacks."""
+        """Monitor span (s) and weight-present threshold (g) from the calibration
+        tab, with safe fallbacks."""
         def f(attr, default):
             try:
                 return float(getattr(self, attr).get())
             except (AttributeError, ValueError, tk.TclError):
                 return default
         return (max(0.5, f("_cal_delay_var", 5.0)),
-                max(0.001, f("_cal_thresh_var", 0.1)),
                 max(0.0, f("_cal_present_var", 0.5)))
 
-    def _stability_metric(self) -> str:
-        """'var' (moving variance, g²) or 'gram' (peak-to-peak spread, g)."""
-        return (self._cal_metric_var.get()
-                if hasattr(self, "_cal_metric_var") else "var")
-
-    def _cal_var_thresh(self) -> float:
-        """Variance threshold (g²) for the stability gate."""
-        try:
-            return max(1e-9, float(self._cal_varthresh_var.get()))
-        except (AttributeError, ValueError, tk.TclError):
-            return 0.1
-
     def _cal_nsamp(self) -> int:
-        """Number of most-recent load-cell readings the stability gate (and the
-        monitor's variance trace) are computed over. Count-based, because load
-        cells report only every weight_interval seconds, so a seconds-based
-        window holds too few samples to be meaningful."""
+        """Number of NEW load-cell readings a cell must stream (since its value
+        last stepped) before its snap unlocks. Count-based, because the load feed
+        round-robins 8 channels and can be slow — a seconds window would hold too
+        few samples to be meaningful."""
         try:
-            return max(2, int(float(self._cal_nsamp_var.get())))
+            return max(1, int(float(self._cal_nsamp_var.get())))
         except (AttributeError, ValueError, tk.TclError):
-            return 4
+            return 2
 
-    def _metric_ok(self, vals) -> bool:
-        """Whether a set of readings is 'stable' under the selected metric."""
-        if len(vals) < 2:
+    def _fresh_step_g(self) -> float:
+        """Reading change (g) that counts as a 'step' (weight placed/removed) and
+        re-anchors the freshness counter for a cell."""
+        try:
+            return max(1e-4, float(self._cal_step_var.get()))
+        except (AttributeError, ValueError, tk.TclError):
+            return 0.5
+
+    def _cell_fresh(self, load_id: int) -> bool:
+        """True once a cell has streamed at least `_cal_nsamp()` NEW readings since
+        its value last stepped — i.e. the slow load feed has caught up to the
+        currently-placed load. Replaces the old variance/stability gate: it does
+        NOT require the reading to be flat, only FRESH at the present load, so a
+        snap can't capture a stale pre-placement value."""
+        lid = int(load_id)
+        anchor = self._fresh_anchor.get(lid)
+        if anchor is None:
             return False
-        if self._stability_metric() == "gram":
-            _, gram_thresh, _ = self._cal_params()
-            return (max(vals) - min(vals)) <= gram_thresh
-        mean = sum(vals) / len(vals)
-        var  = sum((v - mean) ** 2 for v in vals) / len(vals)
-        return var <= self._cal_var_thresh()
-
-    def _cell_stable(self, load_id: int) -> bool:
-        """True when the cell's last N readings pass the selected stability metric
-        (variance by default, or gram spread). N = the 'Stability window
-        (samples)' control. This is computed over exactly the same N readings the
-        monitor's rightmost variance point uses, so what you SEE on the monitor is
-        what GATES the snap button — they can no longer disagree."""
-        n   = self._cal_nsamp()
-        buf = self._cal_buf.get(int(load_id), [])
-        if len(buf) < n:
-            return False
-        recent = buf[-n:]
-        return self._metric_ok([v for (_, v) in recent])
-
-    @staticmethod
-    def _moving_variance(ts, ys, win_ms):
-        """Trailing moving variance of ys over a win_ms window at each point."""
-        out = []
-        j = 0
-        for i in range(len(ts)):
-            while ts[i] - ts[j] > win_ms:
-                j += 1
-            seg = ys[j:i + 1]
-            if len(seg) >= 2:
-                mean = sum(seg) / len(seg)
-                out.append(sum((v - mean) ** 2 for v in seg) / len(seg))
-            else:
-                out.append(0.0)
-        return out
-
-    @staticmethod
-    def _moving_variance_n(ys, n):
-        """Trailing moving variance of ys over the last n SAMPLES at each point.
-        The rightmost value equals the variance over the last n readings, which
-        is exactly what _cell_stable gates on — so the monitor and the gate match
-        regardless of how slowly the load cells report."""
-        out = []
-        for i in range(len(ys)):
-            seg = ys[max(0, i - n + 1):i + 1]
-            if len(seg) >= 2:
-                mean = sum(seg) / len(seg)
-                out.append(sum((v - mean) ** 2 for v in seg) / len(seg))
-            else:
-                out.append(0.0)
-        return out
+        return (self._cal_count.get(lid, 0) - anchor) >= self._cal_nsamp()
 
     def _draw_cal_feed(self, delay):
-        """Redraw each load cell's own monitor: shared x-axis (time), individual
-        y-axis. Mode toggle shows raw/reported grams or the moving variance.
+        """Redraw each load cell's own monitor (raw/reported grams): shared x-axis
+        (time), individual y-axis.
 
-        The plotted window and the variance are SAMPLE-count based (last M reads),
-        so at the slow load-cell report rate the trace is still visible and its
-        rightmost variance point equals what the snap gate uses."""
+        The plotted window is SAMPLE-count based (last M reads), so at the slow
+        load-cell report rate the trace stays visible — it lets you watch the cell
+        refresh at the current load before snapping."""
         now  = self._arduino_ts[0]
         n    = self._cal_nsamp()
         # Show a generous tail so the n-sample variance has context: at least the
@@ -3858,8 +3799,6 @@ class MainWindow(tk.Tk):
         # very long sessions don't redraw the whole history.
         m_show = max(8, 3 * n)
         win_ms = max(30.0, delay * 5.0) * 1000.0
-        mode = (self._cal_disp_var.get()
-                if hasattr(self, "_cal_disp_var") else "raw")
         cells = self._cal_cells
         for idx, (exp_id, side, load_id) in enumerate(cells):
             ax = self._cal_axes.get(load_id)
@@ -3879,12 +3818,8 @@ class MainWindow(tk.Tk):
                 tms = [t for (t, _) in pts]
                 xs  = [(t - now) / 1000.0 for t in tms]
                 raw = [v for (_, v) in pts]
-                if mode == "var":
-                    ys = self._moving_variance_n(raw, n)
-                    yl = "var(g²)"
-                else:
-                    ys = raw
-                    yl = "g"
+                ys = raw
+                yl = "g"
                 ax.plot(xs, ys, color=color, linewidth=1.1, marker="o",
                         markersize=1.8)
             else:
@@ -3901,41 +3836,32 @@ class MainWindow(tk.Tk):
         self._cal_canvas.draw_idle()
 
     def _cal_tick(self):
-        """Periodic: redraw monitors, evaluate per-cell stability, and LATCH each
-        snap button on once its stage has been stable. Once a stage arms, its
-        button stays alive until that snap is taken (no flicker back to waiting)."""
+        """Periodic: redraw the raw monitors and enable each snap button once its
+        cell is FRESH (has streamed enough new readings since its value last
+        stepped). No variance/stability requirement — only freshness."""
         if not getattr(self, "_cal_built", False):
             return
-        delay, thresh, present_g = self._cal_params()
+        delay, present_g = self._cal_params()
         self._cal_present_g = present_g
+        # Publish the step threshold as a plain float the serial thread can read
+        # safely (Tk vars must only be touched on the main thread).
+        self._fresh_step_cached = self._fresh_step_g()
         try:
             self._draw_cal_feed(delay)
         except Exception:
             pass
-        if not hasattr(self, "_snap_armed"):
-            self._snap_armed = set()
         for (exp_id, side, load_id) in self._cal_cells:
-            stable = self._cell_stable(load_id)
-            stage  = "offset" if load_id not in self._offset_done else "gain"
-            key    = (load_id, stage)
-            if stable:
-                # Latch ONLY the current stage. After the offset snap the gain
-                # stage starts un-armed, so the cell must re-stabilise (with the
-                # 50 g now on it) before the 50 g snap unlocks — the same
-                # stability algorithm runs again for gain. Within a stage the
-                # latch is one-way: a momentary wobble after arming won't disarm;
-                # only taking the snap clears it.
-                self._snap_armed.add(key)
-            armed = key in self._snap_armed
+            fresh = self._cell_fresh(load_id)
+            stage = "offset" if load_id not in self._offset_done else "gain"
 
             off_b  = self._snap_btns.get((exp_id, side, "offset"))
             gain_b = self._snap_btns.get((exp_id, side, "gain"))
             if off_b is not None:
                 off_b.config(state=tk.NORMAL
-                             if (stage == "offset" and armed) else tk.DISABLED)
+                             if (stage == "offset" and fresh) else tk.DISABLED)
             if gain_b is not None:
                 gain_b.config(state=tk.NORMAL
-                              if (stage == "gain" and armed) else tk.DISABLED)
+                              if (stage == "gain" and fresh) else tk.DISABLED)
 
             sv = self._snap_svars.get((exp_id, side, "status"))
             if sv is not None:
@@ -3946,12 +3872,8 @@ class MainWindow(tk.Tk):
                 if gv is not None and gv.get() not in ("—", ""):
                     done.append("gain ✓")
                 want = "bottle (offset)" if stage == "offset" else "50 g (gain)"
-                if armed:
-                    tail = f"ready — snap {want}"
-                elif stable:
-                    tail = "stabilizing…"
-                else:
-                    tail = "waiting for stable weight…"
+                tail = (f"ready — snap {want}" if fresh
+                        else "waiting for fresh reading…")
                 sv.set(("  ".join(done) + "   " if done else "") + tail)
         self._cal_job = self.after(500, self._cal_tick)
 
@@ -4038,14 +3960,14 @@ class MainWindow(tk.Tk):
                 f"Run the offset (Snap Bottle) for load ID {load_id} before "
                 f"the gain (Snap 50 g).")
             return
-        # Stability gate: the stage must have ARMED (been stable at least once).
-        # Once armed the button latches on, so we don't re-block on a momentary
-        # wobble — but a stage that never stabilized can't be snapped.
-        if (load_id, kind) not in getattr(self, "_snap_armed", set()):
+        # Freshness gate: the cell must have streamed fresh readings at the present
+        # load before we snap, so we never capture a stale pre-placement value.
+        if not self._cell_fresh(load_id):
             messagebox.showwarning(
-                "Not stable yet",
-                f"Load ID {load_id} hasn't stabilized for {kind} yet — wait for "
-                f"the monitor to settle within the stability threshold.")
+                "Not refreshed yet",
+                f"Load ID {load_id} hasn't streamed enough new readings since the "
+                f"load changed. Wait for the monitor to update at the current "
+                f"{'bottle' if kind == 'offset' else '50 g'} before snapping.")
             return
         # Weight-present guard.
         if not self._weight_present_ok(load_id, kind):
@@ -4059,15 +3981,14 @@ class MainWindow(tk.Tk):
             m = self._models[exp_id]
             if side == "Left":  m.offset_weight_left  = live
             else:               m.offset_weight_right = live
-            # Offset done → advance to the gain stage and clear BOTH arms so the
-            # cell must re-stabilise with the 50 g on it before the gain snap
-            # unlocks (same stability algorithm runs again).
-            self._snap_armed.discard((load_id, "offset"))
-            self._snap_armed.discard((load_id, "gain"))
+            # Re-anchor freshness so the GAIN stage must see new readings at the
+            # 50 g load (placed next) before it unlocks.
+            self._fresh_anchor[int(load_id)] = self._cal_count.get(int(load_id), 0)
         else:
             self._reader.send(f"w{self._gain_avg_ms()}")   # C4: set window first
             self._reader.send(f"k{ch}g")        # per-channel gain (existing cmd)
-            self._snap_armed.discard((load_id, "gain"))
+            # Re-anchor so a re-snap of gain requires fresh readings again.
+            self._fresh_anchor[int(load_id)] = self._cal_count.get(int(load_id), 0)
 
         self._snap_svars[(exp_id, side, kind)].set(
             f"{live:.1f}" if live is not None else "sent")
@@ -4092,14 +4013,14 @@ class MainWindow(tk.Tk):
                     "Run offset on all cells before gain. Missing offset for "
                     f"IDs: {sorted(set(missing))}.")
                 return
-        # Weight-present + stability guard across all cells (armed or live-stable).
-        armed = getattr(self, "_snap_armed", set())
+        # Weight-present + freshness guard across all cells.
         for _, _, lid in load_ids:
-            if (lid, kind) not in armed and not self._cell_stable(lid):
+            if not self._cell_fresh(lid):
                 messagebox.showwarning(
-                    "Not stable",
-                    f"Load ID {lid} hasn't stabilized yet. Wait for every cell "
-                    f"to settle before calibrating all at once.")
+                    "Not refreshed",
+                    f"Load ID {lid} hasn't streamed enough new readings since the "
+                    f"load changed. Wait for every cell to update at the current "
+                    f"load before calibrating all at once.")
                 return
             if not self._weight_present_ok(lid, kind):
                 return
@@ -4114,10 +4035,10 @@ class MainWindow(tk.Tk):
                 m = self._models[exp_id]
                 if side == "Left":  m.offset_weight_left  = live
                 else:               m.offset_weight_right = live
-                self._snap_armed.discard((lid, "offset"))
-                self._snap_armed.discard((lid, "gain"))   # gain must re-stabilise
+                # gain must re-confirm freshness at the 50 g load
+                self._fresh_anchor[int(lid)] = self._cal_count.get(int(lid), 0)
             else:
-                self._snap_armed.discard((lid, "gain"))
+                self._fresh_anchor[int(lid)] = self._cal_count.get(int(lid), 0)
             self._snap_svars[(exp_id, side, kind)].set(
                 f"{live:.1f}" if live is not None else "sent")
             self._update_cal_status(exp_id, side)
@@ -4327,6 +4248,18 @@ class MainWindow(tk.Tk):
                 buf.append((ts, amp))
                 if len(buf) > 600:
                     del buf[:len(buf) - 600]
+                # ── Freshness tracking (drives the snap-unlock gate) ──────────
+                # Count every reading; re-anchor the count whenever the value
+                # STEPS (a weight is placed/removed) so a snap requires N fresh
+                # reads at the NEW load. Runs on the serial thread, so it reads
+                # the cached step threshold (a plain float), never the Tk var.
+                self._cal_count[aid] = self._cal_count.get(aid, 0) + 1
+                prev = self._prev_val.get(aid)
+                if prev is None or abs(amp - prev) > self._fresh_step_cached:
+                    self._fresh_anchor[aid] = self._cal_count[aid]   # step → restart fresh count
+                elif aid not in self._fresh_anchor:
+                    self._fresh_anchor[aid] = self._cal_count[aid]
+                self._prev_val[aid] = amp
                 # Experiment throttle: record this load channel into its model at
                 # most once per weight-interval. Lick events (ids ≥ 8) are never
                 # throttled — they must stay real-time. The Arduino streams load
