@@ -99,7 +99,7 @@ uint32_t gainAvgMs = 2000;   // C4: gain-cal averaging window (ms) — avoids sn
 //
 //   LOADCELL_SETTLE_MS  Extra settle after the MUX switch. Leave at 0 — the
 //                       library's SYNC+WAKEUP already guarantees a settled read.
-#define LOADCELL_DRATE       DRATE_5SPS
+#define LOADCELL_DRATE       DRATE_100SPS
 #define LOADCELL_PERIOD_MS   150
 #define LOADCELL_SETTLE_MS   0
 
@@ -159,7 +159,7 @@ float avgVoltage(uint8_t brd, uint32_t ms) {
 void delayWTouch(int16_t del) {
     for (; del > 0; del -= 20) {
         updateTouch();
-        delay(10);
+        delay(20);
     }
 }
 
@@ -229,9 +229,7 @@ void setup() {
     for (uint8_t i = 4; i--;) {
         adcAmp[i] = new ADS1256(pinSets[i].dry, pinSets[i].reset,
                                  pinSets[i].pdwn, pinSets[i].cs, 2.500);
-        // (No setCallback: this library has no touch-during-delay callback. It is
-        //  unnecessary now anyway — the long library delays are gone, and the
-        //  round-robin loop samples touch every pass via updateTouch().)
+        adcAmp[i]->setCallback(delayWTouch);
         adcAmp[i]->InitializeADC();
         adcAmp[i]->setPGA(PGA_64);
         adcAmp[i]->setDRATE(LOADCELL_DRATE);
@@ -245,7 +243,7 @@ void setup() {
     }
 
     Serial.println(F("# Ready."));
-    if (interval < 1 || interval > 99999) interval = 30;
+    if (interval < 10 || interval > 99999) interval = 30;
     if (gainAvgMs < 100 || gainAvgMs > 60000) gainAvgMs = 2000;   // C4 default 2 s
 }
 
