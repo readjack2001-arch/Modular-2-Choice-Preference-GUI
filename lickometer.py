@@ -2165,6 +2165,14 @@ INIT_STEP_MS    = 1500
 # cell can never lock the GUI forever.
 INIT_MAX_MS     = 180000
 
+# Delay (ms) between sending the gain averaging-window command ('w…') and the
+# gain calibration command ('k…g' / 'cg'). The firmware's 'w' handler ends with
+# readFlush(), which DRAINS the serial RX buffer — so a gain command queued right
+# behind 'w' gets swallowed and the gain cal never runs. Sending the gain command
+# on a short delay lets the firmware consume + flush 'w' first. (Same guard the
+# touch-threshold setter already uses for its two-part send.)
+GAIN_CMD_DELAY_MS = 300
+
 class MainWindow(tk.Tk):
     def __init__(self, initial_port: Optional[str] = None,
                  hub_config: Optional[dict] = None):
@@ -2267,6 +2275,7 @@ class MainWindow(tk.Tk):
         self._fresh_anchor: Dict[int, int]   = {}  # {load_id: count at last step (settling start)}
         self._prev_val:     Dict[int, float] = {}  # {load_id: previous reading (step detection)}
         self._last_fsc:     Dict[int, float] = {}  # {channel: most recent FSC the firmware echoed}
+        self._fsc_seq:      Dict[int, int]   = {}  # {channel: count of FSC echoes seen (robust 'gain ran' signal)}
         self._fresh_step_cached: float = 0.5       # g; step that re-anchors freshness (thread-safe copy)
         # The Arduino now streams load cells continuously (≈ LOADCELL_PERIOD_MS).
         # The "weight interval" is applied HERE, in Python: during the experiment
@@ -2980,14 +2989,19 @@ class MainWindow(tk.Tk):
             for ci, (kind, btn_txt) in enumerate(
                     (("offset", "Snap Bottle"), ("gain", "Snap 50 g"))):
                 init = csec.get(f"{kind}_weight_{side_l}")
-                sv = tk.StringVar(value=f"{init:.1f}" if init is not None else "—")
+                # settings.json is REFERENCE ONLY. We show the last saved number
+                # tagged "(saved)" so it never looks like a this-session result,
+                # and we deliberately do NOT mark the offset "done" from it. The
+                # gain stage therefore stays locked until a real Snap Bottle is
+                # actually sent to the Arduino ('Nko') THIS session, so gain can
+                # never be computed against a stale firmware offset. All
+                # calibration comes from the live load cell via Arduino commands;
+                # saved state never gates a button or stands in for a snap.
+                sv = tk.StringVar(value=f"{init:.1f} (saved)"
+                                  if init is not None else "—")
                 self._snap_svars[(exp_id, side, kind)] = sv
-                if init is not None and kind == "offset":
-                    if side == "Left":  m.offset_weight_left  = float(init)
-                    else:               m.offset_weight_right = float(init)
-                    self._offset_done.add(load_id)
                 tk.Label(grid, textvariable=sv, font=FONTM, bg=BG_PNL,
-                         fg=FG, width=7).grid(row=r, column=3 + ci * 2, padx=3)
+                         fg=FG, width=10).grid(row=r, column=3 + ci * 2, padx=3)
                 b = tk.Button(grid, text=btn_txt, font=FONTB, bg=BG_ALT,
                               fg=FG, relief=tk.FLAT, padx=5, state=tk.DISABLED,
                               command=lambda e=exp_id, s=side, lid=load_id,
@@ -3880,7 +3894,8 @@ class MainWindow(tk.Tk):
                 if load_id in self._offset_done:
                     done.append("offset ✓")
                 gv = self._snap_svars.get((exp_id, side, "gain"))
-                if gv is not None and gv.get() not in ("—", "", _CAL_PENDING):
+                if (gv is not None and gv.get() not in ("—", "", _CAL_PENDING)
+                        and "saved" not in gv.get()):
                     done.append("gain ✓")
                 want = "bottle (offset)" if stage == "offset" else "50 g (gain)"
                 tail = (f"ready — snap {want}" if fresh
@@ -3994,32 +4009,67 @@ class MainWindow(tk.Tk):
         # value than the Arduino did.)
         anchor = self._cal_count.get(int(load_id), 0)
         if kind == "offset":
+            # Offset is a single command (no preceding 'w'), so it is NOT subject
+            # to the readFlush() swallow. Send it and read back the calibrated
+            # empty-bottle reading (≈0 g).
             self._reader.send(f"{ch}ko")        # per-channel offset (new sketch cmd)
             self._offset_done.add(load_id)
             # Re-anchor freshness so the GAIN stage must see new readings at the
             # 50 g load (placed next) before it unlocks.
             self._fresh_anchor[int(load_id)] = anchor
+            self._snap_svars[(exp_id, side, kind)].set(_CAL_PENDING)
+            self._update_cal_status(exp_id, side)
+            self.emit_alert(None, f"Box {exp_id} {side}: offset calibration sent "
+                                  f"(ID {load_id}) — reading back result…", level="info")
+            self._capture_postcal(exp_id, side, load_id, kind, anchor,
+                                  time.monotonic())
         else:
-            # IMPORTANT: send the two commands with a gap. The firmware calls
-            # readFlush() (drains the whole serial buffer) after each command, so
-            # if 'kNg' is already in the buffer when 'w...' finishes, it gets
-            # discarded and the gain cal never runs (FSC unchanged → cell keeps
-            # reporting its pre-cal value). Spacing them lets the firmware finish
-            # flushing before the gain command arrives. 200 ms matches the gap
-            # the offset/gain "all" path already uses.
-            self._reader.send(f"w{self._gain_avg_ms()}")   # C4: set window first
-            self.after(200,
-                       lambda c=ch: self._reader.send(f"k{c}g"))  # then gain
-            # Re-anchor so a re-snap of gain requires fresh readings again.
+            # Set the averaging window, THEN send the gain command on a short
+            # delay so the firmware's 'w'-handler readFlush() can't swallow it.
+            # Read back only once the firmware echoes its NEW FSC, so a swallowed
+            # or garbled gain command can never again fail silently.
+            self._reader.send(f"w{self._gain_avg_ms()}")
             self._fresh_anchor[int(load_id)] = anchor
+            self._snap_svars[(exp_id, side, kind)].set(_CAL_PENDING)
+            self._update_cal_status(exp_id, side)
+            self.emit_alert(None, f"Box {exp_id} {side}: gain window set, "
+                                  f"calibrating (ID {load_id})…", level="info")
+            seq_before = self._fsc_seq.get(ch, 0)
+            self.after(GAIN_CMD_DELAY_MS, lambda: self._fire_gain(
+                exp_id, side, load_id, ch, seq_before, time.monotonic()))
 
-        # Show a transient marker, then fill in the real post-cal reading.
-        self._snap_svars[(exp_id, side, kind)].set(_CAL_PENDING)
-        self._update_cal_status(exp_id, side)
-        self.emit_alert(None, f"Box {exp_id} {side}: {kind} calibration sent "
-                              f"(ID {load_id}) — reading back result…", level="info")
-        self._capture_postcal(exp_id, side, load_id, kind, anchor,
-                              time.monotonic())
+    def _fire_gain(self, exp_id: int, side: str, load_id: int, ch: int,
+                   seq_before, t0: float):
+        """Send the gain command (after the 'w' flush window) and then wait for
+        the firmware's FSC echo to confirm it actually executed."""
+        self._reader.send(f"k{ch}g")
+        self._await_fsc(exp_id, side, load_id, ch, seq_before, t0,
+                        self._gain_avg_ms() / 1000.0 + 8.0)
+
+    def _await_fsc(self, exp_id: int, side: str, load_id: int, ch: int,
+                   seq_before, t0: float, timeout_s: float):
+        """Poll for the firmware's '# chN FSC=…' echo. A NEW echo (the per-channel
+        echo counter advanced past `seq_before`) proves the gain command was
+        received and the cal ran; its ABSENCE (timeout) means the command never
+        reached the Arduino — surfaced as a clear warning instead of a silent
+        wrong value. On success, read back the calibrated grams (≈50)."""
+        if self._fsc_seq.get(ch, 0) > seq_before:
+            # Gain executed. Read back a fresh POST-cal grams value (the FSC echo
+            # prints before streaming resumes, so _last_raw is still pre-cal here).
+            anchor = self._cal_count.get(int(load_id), 0)
+            self._capture_postcal(exp_id, side, load_id, "gain", anchor,
+                                  time.monotonic())
+            return
+        if (time.monotonic() - t0) >= timeout_s:
+            sv = self._snap_svars.get((exp_id, side, "gain"))
+            if sv is not None:
+                sv.set("NO ECHO")
+            self.emit_alert(None, f"Box {exp_id} {side}: gain produced NO FSC echo "
+                                  f"— the command did not reach the Arduino. Check "
+                                  f"the Terminal tab and retry.", level="warning")
+            return
+        self.after(150, lambda: self._await_fsc(
+            exp_id, side, load_id, ch, seq_before, t0, timeout_s))
 
     def _capture_postcal(self, exp_id: int, side: str, load_id: int,
                          kind: str, anchor: int, t0: float):
@@ -4101,31 +4151,46 @@ class MainWindow(tk.Tk):
                 return
             if not self._weight_present_ok(lid, kind):
                 return
-        if kind == "gain":
-            # ensure the Arduino has the current averaging window before 'cg'.
-            # Delay 'cg' so the firmware's post-command readFlush() (which drains
-            # the whole serial buffer) can't discard it — same hazard as the
-            # per-cell gain snap above.
-            self._reader.send(f"w{self._gain_avg_ms()}")
-            self.after(200, lambda: self._reader.send("cg"))
-        else:
+        if kind == "offset":
+            # 'o' calibrates all offsets in one blocking pass; no preceding 'w',
+            # so no readFlush swallow. Send it and read each cell back.
             self._reader.send("o")
-        t0 = time.monotonic()
-        for exp_id, side, lid in load_ids:
-            anchor = self._cal_count.get(int(lid), 0)
-            if kind == "offset":
+            t0 = time.monotonic()
+            for exp_id, side, lid in load_ids:
+                anchor = self._cal_count.get(int(lid), 0)
                 self._offset_done.add(lid)
-            # gain/offset both must re-confirm freshness at the next load
-            self._fresh_anchor[int(lid)] = anchor
-            # Same post-cal read-back as the per-cell snap, so every cell shows
-            # its calibrated reading (≈0 g offset, ≈50 g gain), not the pre-snap
-            # value. NOTE: 'o'/'cg' calibrate all 8 channels in one blocking pass,
-            # so the read-back necessarily reflects the new constants.
-            self._snap_svars[(exp_id, side, kind)].set(_CAL_PENDING)
-            self._update_cal_status(exp_id, side)
-            self._capture_postcal(exp_id, side, lid, kind, anchor, t0)
-        self.emit_alert(None, f"All cells: {kind} calibration sent — "
-                              f"reading back results…", level="info")
+                self._fresh_anchor[int(lid)] = anchor
+                self._snap_svars[(exp_id, side, kind)].set(_CAL_PENDING)
+                self._update_cal_status(exp_id, side)
+                self._capture_postcal(exp_id, side, lid, kind, anchor, t0)
+            self.emit_alert(None, "All cells: offset calibration sent — "
+                                  "reading back results…", level="info")
+        else:
+            # Set the window, then send 'cg' on a delay so the 'w' readFlush()
+            # can't swallow it. Each cell's read-back waits for its own FSC echo.
+            self._reader.send(f"w{self._gain_avg_ms()}")
+            for exp_id, side, lid in load_ids:
+                self._fresh_anchor[int(lid)] = self._cal_count.get(int(lid), 0)
+                self._snap_svars[(exp_id, side, kind)].set(_CAL_PENDING)
+                self._update_cal_status(exp_id, side)
+            fsc_before = {self._cal_channel_of(lid): self._fsc_seq.get(
+                          self._cal_channel_of(lid), 0) for _, _, lid in load_ids}
+            self.after(GAIN_CMD_DELAY_MS, lambda: self._fire_gain_all(
+                load_ids, fsc_before, time.monotonic()))
+            self.emit_alert(None, "All cells: gain window set, calibrating…",
+                            level="info")
+
+    def _fire_gain_all(self, load_ids, fsc_before, t0):
+        """Send 'cg' (all-channel gain) after the 'w' flush window, then wait for
+        each channel's FSC echo before reading it back."""
+        self._reader.send("cg")
+        # 'cg' calibrates the 8 channels sequentially, so the last channel's echo
+        # can arrive ~8 windows later — give every cell room for the full sweep.
+        sweep_timeout = 8.0 * (self._gain_avg_ms() / 1000.0) + 12.0
+        for exp_id, side, lid in load_ids:
+            ch = self._cal_channel_of(lid)
+            self._await_fsc(exp_id, side, lid, ch, fsc_before.get(ch), t0,
+                            sweep_timeout)
 
     def _update_cal_status(self, exp_id: int, side: str):
         """Refresh the per-cell status text (offset ✓ / gain ✓ / locked)."""
@@ -4133,7 +4198,9 @@ class MainWindow(tk.Tk):
         load_id = ch["left_load"] if side == "Left" else ch["right_load"]
         off = load_id in getattr(self, "_offset_done", set())
         gain_val = self._snap_svars.get((exp_id, side, "gain"))
-        gained = gain_val is not None and gain_val.get() not in ("—", "", _CAL_PENDING)
+        gained = (gain_val is not None
+                  and gain_val.get() not in ("—", "", _CAL_PENDING)
+                  and "saved" not in gain_val.get())
         if off and gained:
             txt = "offset ✓  gain ✓"
         elif off:
@@ -4387,7 +4454,9 @@ class MainWindow(tk.Tk):
                 mfsc = _FSC_RE.search(ln)
                 if mfsc:
                     try:
-                        self._last_fsc[int(mfsc.group(1))] = float(mfsc.group(2))
+                        chn = int(mfsc.group(1))
+                        self._last_fsc[chn] = float(mfsc.group(2))
+                        self._fsc_seq[chn]  = self._fsc_seq.get(chn, 0) + 1
                     except (ValueError, IndexError):
                         pass
             self._term_text.config(state=tk.NORMAL)
