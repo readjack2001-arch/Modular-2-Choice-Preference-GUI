@@ -61,18 +61,23 @@ SeeedQTouch QTouch[4];
 //Active touch Selectors
 TCA9548A i2cMux[4];
 
-bool doOnce[8] = { false }; //Just to do only once flags
-uint32_t T[8] = { 0 }; //Time length of licks  
-uint32_t lickCnt[8] = { 0 }; //Lick Counts
-uint32_t lickAvg[8] = { 0 }; //Averaging lick lengths
-uint32_t interval; // Time in S that the r command reports data must be introduced with i command before run
+bool doOnce[8] = { false }; //Just to do only once flags (used by 'l' debug command)
+uint32_t T[8] = { 0 }; //Time length of licks (used by 'l' debug command)
+uint32_t lickCnt[8] = { 0 }; //Lick Counts (used by 'l' debug command)
+uint32_t lickAvg[8] = { 0 }; //Averaging lick lengths (used by 'l' debug command)
+uint32_t interval; // Time in S that the r command reports weights, set with i command before run
 uint8_t BCHi[2] = { 2, 1 };  //Inverted channel to match hardware
+
+// --- Event streaming state (for the 'r' run) ---
+bool streaming = false;          // true only while 'r' is streaming; gates event output
+bool touchState[8] = { false };  // current touch state per station, for onset/offset edges
 
 void helpSumary() {
   Serial.println(F("Lickometer Columbia AIC V0.1" \
   "\n---------------------------------------------------------------------------------------\n"
-  "Sending values of : Weight in g, lick count, average duration of licks in mS\n" \
-  "\tSend i <enter> to see run interval, or set with iSSSSS <enter> where SSSSS is 10 to 99999 in Sec\n" \
+  "Run (r) streams events as: timestamp_ms , id , amplitude\n" \
+  "   id 0-7 = weight in g | id 8-15 = lick onset | id 16-23 = lick offset\n" \
+  "\tSend i <enter> to see weight-report interval, or set with iSSSSS <enter> (10 to 99999 Sec)\n" \
   "\tSend r <enter> to run, s to stop when running\n" \
   "\tSend sX <enter> to access to lick threshold, where X is channel 0 to 7. As s7 to for channel 7.\n" \
   "\t   Next <enter> to read current threshold setting, or TTT<enter> where TTT is a 10 to 255 setting\n" \
@@ -283,48 +288,35 @@ void loop()
         }
         Serial.println("Touch Calibrated!");
         break;
-      //Main Run output get reported each INTERVAL->  Weight 0, Lick Count 0, Lick Avg 0, ...Weight 7, Lick Count 7, Lick Avg 7 <CR>  (Total 12 numerical values)
+      // EVENT STREAM: licks emit onset/offset in real time; weights emit every INTERVAL.
+      // Output is  timestamp_ms , id , amplitude   (id 0-7 weight g, 8-15 onset, 16-23 offset)
       case 'r':
-        cTime=millis();
-        //TimeInterrupt.addInterrupt(updateTouch, 200); //20 ms Touch sampling
-        while (Serial.read() != 's') //The conversion is stopped by a character received from the serial port
+        cTime = millis();
+        streaming = true;
+        for (uint8_t i = 0; i < 8; i++) touchState[i] = false;  //start from a clean slate
+        Serial.println(F("# timestamp_ms,id,amplitude"));
+        Serial.println(F("# id 0-7 weight g | 8-15 lick onset | 16-23 lick offset"));
+        while (Serial.read() != 's') //The stream is stopped by an 's' received from the serial port
         {
-          if (millis()-cTime > interval*1000){ //INTERVAL sec past, so send report
-            cTime=millis(); //reset
-            //Run all 4 ADCs and 4 touch sensors reports  (0 to 3). Each uses 2 channels
-            for (uint8_t brd = 0; brd <4; brd++) {
+          if (millis() - cTime > interval * 1000) { //INTERVAL sec past, so emit all weights
+            cTime = millis(); //reset
+            for (uint8_t brd = 0; brd < 4; brd++) {
                 for (uint8_t brdCH = 0; brdCH < 2; brdCH++) {
                     adcAmp[brd]->setMUX(diffList[brdCH]); //Select channel in board
-                    delayWTouch(100);  //Delay and update sample touching
-                    // Lick length Average in last minute for this channel with div by 0 check
-                    lickCnt[(brd << 1) + brdCH] ? lickAvg[(brd << 1) + brdCH] /= lickCnt[(brd << 1) + brdCH] : lickAvg[(brd << 1) + brdCH] = 0;
+                    delayWTouch(100);  //Delay and keep sampling touch during settle
                     //recover right calibration offset parameters for the board/channel used
                     adcAmp[brd]->writeRegister(OFC0_REG, CALSys[brd][brdCH].OFC0);
                     adcAmp[brd]->writeRegister(OFC1_REG, CALSys[brd][brdCH].OFC1);
                     adcAmp[brd]->writeRegister(OFC2_REG, CALSys[brd][brdCH].OFC2);
                     //cell @5V should give around 3.5mV/100g(FS) or 35uV/g. 1/35uV= 28571.429
-                    //Internally ADC Gain PGA is 64 so the converter sees 192mV/100g(FS) or 2.24mV/g 
-                    Serial.print(adcAmp[brd]->convertToVoltage(adcAmp[brd]->readSingle()) * 28571.429 * CALSys[brd][brdCH].FSC, 1);
-                    Serial.print(",");
-                    Serial.print (lickCnt[(brd<<1) + brdCH]); Serial.print (",");
-                    Serial.print (lickAvg[(brd << 1) + brdCH]); 
-                    if (brd == 3 && brdCH==1)
-                       Serial.println("");
-                    else
-                       Serial.print(", ");
+                    emitEvent((brd << 1) + brdCH,
+                              adcAmp[brd]->convertToVoltage(adcAmp[brd]->readSingle()) * 28571.429 * CALSys[brd][brdCH].FSC);
                 }
             }
-          //Reset all lick counting and averaging
-            for (uint8_t  i=8; i-- ;) {
-              doOnce[i]=false; //Just to do only once flags
-              T[i]=0; //Time length of licks  
-              lickCnt[i]=0; //Lick Counts
-              lickAvg[i]=0; //Averaging lick lengths
-            }
-          } //End of slow INTERVAL report loop
-          updateTouch();  //Sample Touching
+          }
+          updateTouch();  //Sample touch; emits onset/offset events as they happen
         }
-     //   TimeInterrupt.removeInterrupt(updateTouch); //20 ms Touch sampling
+        streaming = false;
         Serial.println("Data stop received!");
         break;
       case 'h': //Help
@@ -486,6 +478,15 @@ void valCfg(uint8_t brd) {
     }
 }
 
+// Single event line:  timestamp_ms , id , amplitude
+void emitEvent(uint8_t id, float amp) {
+    Serial.print(millis());
+    Serial.print(',');
+    Serial.print(id);
+    Serial.print(',');
+    Serial.println(amp, 1);
+}
+
 //Call back function to support I2C touch during delays
 void delayWTouch(int16_t del) {  //delay in chunks of 20mS , ex. delayWTouch(100) will delay 20mS X 5 times and a bit more
     for (; del>0; del-=20) {
@@ -493,27 +494,26 @@ void delayWTouch(int16_t del) {  //delay in chunks of 20mS , ex. delayWTouch(100
         delay(20);
     }
 }
+
+// Sample all 8 touch keys; on each state change, emit an onset (id 8-15) or
+// offset (id 16-23) event. No counts/averages are computed.
 void updateTouch() {
     for (char brd = 4; brd--;) {
-        i2cMux[brd].setChannel(CHAN0);//Turn on access to this brd
+        i2cMux[brd].setChannel(CHAN0);                       //Turn on access to this board
         for (uint8_t brdCH = 2; brdCH--;) {
-            if (QTouch[brd].isTouch(BCHi[brdCH])) {  // if there was a touch at key channel 1 or 2  in each board (0 is for comp. guard)
+            uint8_t ch = (brd << 1) + brdCH;                 //station 0..7
+            bool nowTouch = QTouch[brd].isTouch(BCHi[brdCH]);//key 1 or 2 (0 is comp. guard)
+            if (nowTouch && !touchState[ch]) {               //rising edge -> ONSET
+                touchState[ch] = true;
                 digitalWrite(LED, 1);
-                //Run arrays values from 7 to 0 (odd)   
-                if (!doOnce[(brd << 1) + brdCH]) {
-                    doOnce[(brd << 1) + brdCH] = true;
-                    lickCnt[(brd << 1) + brdCH]++;
-                    T[(brd << 1) + brdCH] = millis(); //Start Lick
-                }
+                if (streaming) emitEvent(8 + ch, 1);
             }
-            else if (doOnce[(brd << 1) + brdCH]) { //this touch is released 
+            else if (!nowTouch && touchState[ch]) {          //falling edge -> OFFSET
+                touchState[ch] = false;
                 digitalWrite(LED, 0);
-                doOnce[(brd << 1) + brdCH] = false;
-                T[(brd << 1) + brdCH] = millis() - T[(brd << 1) + brdCH]; //capture end of lick timing
-                lickAvg[(brd << 1) + brdCH] += T[(brd << 1) + brdCH]; //accumulate lick time length 
+                if (streaming) emitEvent(16 + ch, 0);
             }
         }
-        i2cMux[brd].setChannel(CHAN_NONE);//Turn off access to this chip
+        i2cMux[brd].setChannel(CHAN_NONE);                   //Turn off access to this chip
     }
-
 }
