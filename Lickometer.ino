@@ -9,6 +9,8 @@
 //   r          Start streaming events
 //   s          Stop  streaming events
 //   iNNNNN     Set weight-report interval in seconds (10–99999)
+//              NOTE: load-cell rate is now set by LOADCELL_PERIOD_MS in the config
+//              block below, NOT by this command. Kept only so the GUI won't error.
 //   wNNNNN     Set gain-cal averaging window in ms (100–60000)
 //   o          Offset calibration  (all channels, bottles empty)
 //   Nko        Offset calibration  (channel N only, 0-7)
@@ -76,8 +78,36 @@ SeeedQTouch  QTouch[4];
 TCA9548A     i2cMux[4];
 
 uint8_t  BCHi[2]   = {2, 1}; // Inverted channel index to match hardware
-uint32_t interval  = 1;     // Weight-report interval in seconds (default 30)
+uint32_t interval  = 1;     // Weight-report interval in seconds (legacy; no longer
+                            // gates load-cell output — see config block below)
 uint32_t gainAvgMs = 2000;   // C4: gain-cal averaging window (ms) — avoids snap jumps
+
+// ── Load-cell streaming rate config ───────────────────────────────────────────
+// Output rate is set here, NOT by the `i`/interval command. Tune and re-upload.
+//
+//   LOADCELL_DRATE      ADS1256 data rate (single tuning point). Lower = less
+//                       noise, longer settle: DRATE_100SPS ≈ 10 ms, DRATE_50SPS
+//                       ≈ 20 ms, DRATE_5SPS ≈ 200 ms (old). Settling after a
+//                       channel switch is now handled in the library (setMUX
+//                       issues SYNC+WAKEUP), so this stays correct at any rate.
+//
+//   LOADCELL_PERIOD_MS  Spacing between consecutive emitted values. One channel
+//                       is read per tick, cycling 0->7 (round-robin). 150 -> a
+//                       new value every 150 ms (matches the 100-200 ms goal); a
+//                       full 8-channel sweep takes 8 x this. Lower it for faster
+//                       output now that the per-read time is only ~10-15 ms.
+//
+//   LOADCELL_SETTLE_MS  Extra settle after the MUX switch. Leave at 0 — the
+//                       library's SYNC+WAKEUP already guarantees a settled read.
+#define LOADCELL_DRATE       DRATE_5SPS
+#define LOADCELL_PERIOD_MS   150
+#define LOADCELL_SETTLE_MS   0
+//   LOADCELL_DISCARD    Number of conversions to read-and-throw-away after a
+//                       channel switch + offset load, before keeping a value.
+//                       After a SYNC (issued by setMUX) the filter is reset, so
+//                       1 is enough at DRATE_5SPS. RAISE to 2 if you increase the
+//                       data rate and see the first post-switch sample biased.
+#define LOADCELL_DISCARD     1
 
 // ── State ─────────────────────────────────────────────────────────────────────
 bool     streaming            = false;
@@ -131,11 +161,36 @@ float avgVoltage(uint8_t brd, uint32_t ms) {
     return n ? (float)(sum / n) : 0.0f;
 }
 
+// Settled, offset-correct single-cell read. Reproduces the OLD firmware's proven
+// sequence and is the single path all weight reads go through:
+//   1) switch channel (setMUX issues SYNC+WAKEUP -> resets the SINC filter),
+//   2) load THIS channel's offset bytes (OFC is SHARED per chip across the two
+//      differential cells, so it MUST be reloaded on every read),
+//   3) discard LOADCELL_DISCARD settled conversion(s) so the kept sample is taken
+//      after the channel has settled with the final OFC applied,
+//   4) read + convert with the per-channel software full-scale (FSC).
+float readGrams(uint8_t brd, uint8_t brdCH) {
+    adcAmp[brd]->setMUX(diffList[brdCH]);
+    adcAmp[brd]->writeRegister(OFC0_REG, CALSys[brd][brdCH].OFC0);
+    adcAmp[brd]->writeRegister(OFC1_REG, CALSys[brd][brdCH].OFC1);
+    adcAmp[brd]->writeRegister(OFC2_REG, CALSys[brd][brdCH].OFC2);
+    for (uint8_t d = 0; d < LOADCELL_DISCARD; d++)
+        adcAmp[brd]->readSingle();                 // discard settling conversion(s)
+    long raw = adcAmp[brd]->readSingle();          // keep: settled + offset-correct
+
+    // ── TEMP DEBUG — remove after diagnosis ──────────────────────────
+    Serial.print(F("#RAW ch")); Serial.print((brd << 1) + brdCH);
+    Serial.print(F(" raw=")); Serial.println(raw);
+    // ──────────────────────────────────────────────────────────────────
+
+    return adcAmp[brd]->convertToVoltage(raw) * 28571.429f * CALSys[brd][brdCH].FSC  ; 
+}
+
 // Callback for ADS library: keep sampling touch during long ADC waits
 void delayWTouch(int16_t del) {
     for (; del > 0; del -= 20) {
         updateTouch();
-        delay(20);
+        delay(10);
     }
 }
 
@@ -165,7 +220,7 @@ void valCfg(uint8_t brd) {
     if ((adcAmp[brd]->readRegister(ADCON_REG) & 0x07) == 0 ||
          adcAmp[brd]->readRegister(DRATE_REG) == DRATE_30000SPS) {
         adcAmp[brd]->setPGA(PGA_64);
-        adcAmp[brd]->setDRATE(DRATE_100SPS);
+        adcAmp[brd]->setDRATE(LOADCELL_DRATE);
     }
 }
 
@@ -205,10 +260,12 @@ void setup() {
     for (uint8_t i = 4; i--;) {
         adcAmp[i] = new ADS1256(pinSets[i].dry, pinSets[i].reset,
                                  pinSets[i].pdwn, pinSets[i].cs, 2.500);
-        adcAmp[i]->setCallback(delayWTouch);
+        // (No setCallback: this library has no touch-during-delay callback. It is
+        //  unnecessary now anyway — the long library delays are gone, and the
+        //  round-robin loop samples touch every pass via updateTouch().)
         adcAmp[i]->InitializeADC();
         adcAmp[i]->setPGA(PGA_64);
-        adcAmp[i]->setDRATE(DRATE_100SPS);
+        adcAmp[i]->setDRATE(LOADCELL_DRATE);
         digitalWrite(LED, 1);
         adcAmp[i]->writeRegister(FSC0_REG, 0x4C);
         adcAmp[i]->writeRegister(FSC1_REG, 0xE1);
@@ -219,7 +276,7 @@ void setup() {
     }
 
     Serial.println(F("# Ready."));
-    if (interval < 10 || interval > 99999) interval = 30;
+    if (interval < 1 || interval > 99999) interval = 30;
     if (gainAvgMs < 100 || gainAvgMs > 60000) gainAvgMs = 2000;   // C4 default 2 s
 }
 
@@ -318,7 +375,11 @@ void loop() {
             } else {
                 Serial.println(F("# Bad window (100-60000 ms)"));
             }
-            readFlush();
+            // NOTE: do NOT readFlush() here. The GUI sends the gain command
+            // ('kNg' / 'cg') immediately after 'w', and both can arrive in the
+            // RX buffer together. readFlush() would DRAIN the queued gain command,
+            // so the gain calibration would silently never run. Leaving the buffer
+            // intact lets the next loop() iteration read and execute the gain cmd.
             return;
         }
 
@@ -328,7 +389,8 @@ void loop() {
             for (uint8_t brd = 4; brd--;) {
                 for (uint8_t brdCH = 2; brdCH--;) {
                     adcAmp[brd]->setMUX(diffList[brdCH]);
-                    delay(10);
+                    for (uint8_t d = 0; d < LOADCELL_DISCARD; d++)
+                        adcAmp[brd]->readSingle();   // settle the channel before SYSOCAL
                     adcAmp[brd]->sendDirectCommand(SYSOCAL);
                     adcAmp[brd]->waitForLowDRDY();
                     CALSys[brd][brdCH].OFC0 = adcAmp[brd]->readRegister(OFC0_REG);
@@ -351,10 +413,11 @@ void loop() {
                 uint8_t brd   = ch >> 1;
                 uint8_t brdCH = ch &  1;
                 adcAmp[brd]->setMUX(diffList[brdCH]);
-                delay(10);
                 adcAmp[brd]->writeRegister(OFC0_REG, CALSys[brd][brdCH].OFC0);
                 adcAmp[brd]->writeRegister(OFC1_REG, CALSys[brd][brdCH].OFC1);
                 adcAmp[brd]->writeRegister(OFC2_REG, CALSys[brd][brdCH].OFC2);
+                for (uint8_t d = 0; d < LOADCELL_DISCARD; d++)
+                    adcAmp[brd]->readSingle();   // settle with final OFC before averaging
                 CALSys[brd][brdCH].FSC =
                     50.0f / (avgVoltage(brd, gainAvgMs) * 28571.429f);
                 EEPROM.put(CALSysSize * ch + 3, CALSys[brd][brdCH].FSC);
@@ -375,10 +438,11 @@ void loop() {
                 uint8_t brd   = ch >> 1;
                 uint8_t brdCH = ch &  1;
                 adcAmp[brd]->setMUX(diffList[brdCH]);
-                delay(10);
                 adcAmp[brd]->writeRegister(OFC0_REG, CALSys[brd][brdCH].OFC0);
                 adcAmp[brd]->writeRegister(OFC1_REG, CALSys[brd][brdCH].OFC1);
                 adcAmp[brd]->writeRegister(OFC2_REG, CALSys[brd][brdCH].OFC2);
+                for (uint8_t d = 0; d < LOADCELL_DISCARD; d++)
+                    adcAmp[brd]->readSingle();   // settle with final OFC before averaging
                 CALSys[brd][brdCH].FSC =
                     50.0f / (avgVoltage(brd, gainAvgMs) * 28571.429f);
                 EEPROM.put(CALSysSize * ch + 3, CALSys[brd][brdCH].FSC);
@@ -401,7 +465,8 @@ void loop() {
             uint8_t brd   = ch >> 1;
             uint8_t brdCH = ch &  1;
             adcAmp[brd]->setMUX(diffList[brdCH]);
-            delay(10);
+            for (uint8_t d = 0; d < LOADCELL_DISCARD; d++)
+                adcAmp[brd]->readSingle();   // settle the channel before SYSOCAL
             adcAmp[brd]->sendDirectCommand(SYSOCAL);
             adcAmp[brd]->waitForLowDRDY();
             CALSys[brd][brdCH].OFC0 = adcAmp[brd]->readRegister(OFC0_REG);
@@ -438,23 +503,21 @@ void loop() {
     // ── Streaming loop ────────────────────────────────────────────────────────
     if (streaming) {
         static uint32_t lastWeightTime = 0;
+        static uint8_t  rrCh           = 0;   // round-robin load-cell channel 0-7
 
-        // Emit all load cell values every `interval` seconds
-        if (millis() - lastWeightTime >= interval * 1000UL) {
+        // Emit ONE load-cell value per tick, cycling through the 8 channels.
+        // A new value appears every LOADCELL_PERIOD_MS; a full 8-channel sweep
+        // takes 8 x LOADCELL_PERIOD_MS. Reading one channel per pass (instead of
+        // all 8 in a blocking burst) keeps the loop short so touch onset/offset
+        // events stay responsive between load-cell reads. Settling after the MUX
+        // switch is handled inside the library (setMUX issues SYNC+WAKEUP).
+        if (millis() - lastWeightTime >= LOADCELL_PERIOD_MS) {
             lastWeightTime = millis();
-            for (uint8_t brd = 0; brd < 4; brd++) {
-                for (uint8_t brdCH = 0; brdCH < 2; brdCH++) {
-                    adcAmp[brd]->setMUX(diffList[brdCH]);
-                    delayWTouch(5);
-                    adcAmp[brd]->writeRegister(OFC0_REG, CALSys[brd][brdCH].OFC0);
-                    adcAmp[brd]->writeRegister(OFC1_REG, CALSys[brd][brdCH].OFC1);
-                    adcAmp[brd]->writeRegister(OFC2_REG, CALSys[brd][brdCH].OFC2);
-                    float grams = adcAmp[brd]->convertToVoltage(
-                                      adcAmp[brd]->readSingle())
-                                  * 28571.429f * CALSys[brd][brdCH].FSC;
-                    emitEvent((brd << 1) + brdCH, grams);
-                }
-            }
+            uint8_t brd   = rrCh >> 1;
+            uint8_t brdCH = rrCh &  1;
+            float grams = readGrams(brd, brdCH);   // settled + offset-correct (old-firmware sequence)
+            emitEvent(rrCh, grams);                // id 0-7, same format as before
+            rrCh = (rrCh + 1) & 0x07;        // next channel, wrap 0-7
         }
 
         // Always sample touch (emits onset/offset events in real time)
