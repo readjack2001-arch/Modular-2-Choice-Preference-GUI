@@ -115,6 +115,20 @@ bool     touchState[8]        = {false};
 bool     awaitingThreshValue  = false;  // true after "sN" while we wait for the value
 int8_t   threshChannel        = -1;     // which channel we're setting threshold for
 
+// ── Non-blocking load-cell read state machine ─────────────────────────────────
+// The load-cell ADC (slow at low DRATE) and the lick/touch sensors are read by
+// the SAME single-threaded loop. The old code read a load cell with a blocking
+// call that stalled the loop ~400 ms at DRATE_5SPS, during which touch was never
+// sampled — so quick licks were missed. This state machine never blocks on the
+// ADC: it kicks off a conversion, then polls DRDY each loop pass and only pulls
+// the value once it's ready, so updateTouch() runs continuously regardless of
+// the load-cell data rate. The two detections are now fully independent.
+enum LCState { LC_IDLE, LC_WAIT };
+LCState  lcState        = LC_IDLE;
+uint8_t  lcCh           = 0;            // round-robin load-cell channel 0-7
+uint8_t  lcDiscardLeft  = 0;            // settling conversions still to discard
+uint32_t lcStartMs      = 0;           // for a dead-amp timeout
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 void readFlush() {
@@ -177,13 +191,62 @@ float readGrams(uint8_t brd, uint8_t brdCH) {
     for (uint8_t d = 0; d < LOADCELL_DISCARD; d++)
         adcAmp[brd]->readSingle();                 // discard settling conversion(s)
     long raw = adcAmp[brd]->readSingle();          // keep: settled + offset-correct
+    return adcAmp[brd]->convertToVoltage(raw) * 28571.429f * CALSys[brd][brdCH].FSC;
+}
 
-    // ── TEMP DEBUG — remove after diagnosis ──────────────────────────
-    Serial.print(F("#RAW ch")); Serial.print((brd << 1) + brdCH);
-    Serial.print(F(" raw=")); Serial.println(raw);
-    // ──────────────────────────────────────────────────────────────────
+// Non-blocking equivalent of readGrams for the streaming loop. Advances the
+// load-cell read by at most one tiny step per call and returns immediately,
+// so the caller can keep sampling touch every loop pass. Same read sequence as
+// readGrams (setMUX -> load OFC -> discard settling -> keep), just spread across
+// many loop iterations instead of blocking through it.
+void serviceLoadCells() {
+    static uint32_t lastWeightTime = 0;
+    uint8_t brd   = lcCh >> 1;
+    uint8_t brdCH = lcCh & 1;
 
-    return adcAmp[brd]->convertToVoltage(raw) * 28571.429f * CALSys[brd][brdCH].FSC  ; 
+    switch (lcState) {
+    case LC_IDLE:
+        // Wait until it's time to start the next channel, then kick off a
+        // conversion. setMUX issues SYNC+WAKEUP (resets the filter and starts a
+        // fresh conversion); writing OFC + setMUX is fast (microseconds).
+        if (millis() - lastWeightTime < LOADCELL_PERIOD_MS) return;
+        lastWeightTime = millis();
+        adcAmp[brd]->setMUX(diffList[brdCH]);
+        adcAmp[brd]->writeRegister(OFC0_REG, CALSys[brd][brdCH].OFC0);
+        adcAmp[brd]->writeRegister(OFC1_REG, CALSys[brd][brdCH].OFC1);
+        adcAmp[brd]->writeRegister(OFC2_REG, CALSys[brd][brdCH].OFC2);
+        lcDiscardLeft = LOADCELL_DISCARD;
+        lcStartMs     = millis();
+        lcState       = LC_WAIT;
+        return;
+
+    case LC_WAIT:
+        // Poll DRDY WITHOUT blocking. If the conversion isn't ready yet, return
+        // now so the loop goes straight back to updateTouch().
+        if (digitalRead(pinSets[brd].dry) == HIGH) {
+            // Dead-amp safety: if a board never asserts DRDY, skip it instead of
+            // stalling the round-robin (touch keeps running regardless).
+            if (millis() - lcStartMs > 1000UL) {
+                lcCh    = (lcCh + 1) & 0x07;
+                lcState = LC_IDLE;
+            }
+            return;
+        }
+        // DRDY low -> a conversion is ready; readSingle() returns immediately.
+        {
+            long raw = adcAmp[brd]->readSingle();
+            if (lcDiscardLeft > 0) {
+                lcDiscardLeft--;        // throw away settling conversion, keep waiting
+                return;
+            }
+            float grams = adcAmp[brd]->convertToVoltage(raw)
+                          * 28571.429f * CALSys[brd][brdCH].FSC;
+            emitEvent(lcCh, grams);
+            lcCh    = (lcCh + 1) & 0x07; // advance round-robin
+            lcState = LC_IDLE;
+        }
+        return;
+    }
 }
 
 // Callback for ADS library: keep sampling touch during long ADC waits
@@ -319,6 +382,7 @@ void loop() {
             if (!streaming) {
                 streaming = true;
                 for (uint8_t i = 0; i < 8; i++) touchState[i] = false;
+                lcState = LC_IDLE; lcCh = 0; lcDiscardLeft = 0;  // fresh round-robin
                 Serial.println(F("# timestamp_ms,id,amplitude"));
                 Serial.println(F("# id 0-7=load(g) | 8-15=onset | 16-23=offset"));
             }
@@ -375,11 +439,7 @@ void loop() {
             } else {
                 Serial.println(F("# Bad window (100-60000 ms)"));
             }
-            // NOTE: do NOT readFlush() here. The GUI sends the gain command
-            // ('kNg' / 'cg') immediately after 'w', and both can arrive in the
-            // RX buffer together. readFlush() would DRAIN the queued gain command,
-            // so the gain calibration would silently never run. Leaving the buffer
-            // intact lets the next loop() iteration read and execute the gain cmd.
+            readFlush();
             return;
         }
 
@@ -502,25 +562,13 @@ void loop() {
 
     // ── Streaming loop ────────────────────────────────────────────────────────
     if (streaming) {
-        static uint32_t lastWeightTime = 0;
-        static uint8_t  rrCh           = 0;   // round-robin load-cell channel 0-7
+        // Load cells: non-blocking. Advances at most one tiny step, returning
+        // immediately when the next ADC conversion isn't ready yet.
+        serviceLoadCells();
 
-        // Emit ONE load-cell value per tick, cycling through the 8 channels.
-        // A new value appears every LOADCELL_PERIOD_MS; a full 8-channel sweep
-        // takes 8 x LOADCELL_PERIOD_MS. Reading one channel per pass (instead of
-        // all 8 in a blocking burst) keeps the loop short so touch onset/offset
-        // events stay responsive between load-cell reads. Settling after the MUX
-        // switch is handled inside the library (setMUX issues SYNC+WAKEUP).
-        if (millis() - lastWeightTime >= LOADCELL_PERIOD_MS) {
-            lastWeightTime = millis();
-            uint8_t brd   = rrCh >> 1;
-            uint8_t brdCH = rrCh &  1;
-            float grams = readGrams(brd, brdCH);   // settled + offset-correct (old-firmware sequence)
-            emitEvent(rrCh, grams);                // id 0-7, same format as before
-            rrCh = (rrCh + 1) & 0x07;        // next channel, wrap 0-7
-        }
-
-        // Always sample touch (emits onset/offset events in real time)
+        // Touch: sampled EVERY loop pass, independent of the load-cell rate, so
+        // even a quick brush is caught. This is the fix for the low-sensitivity
+        // (only-registers-on-squeeze) behavior.
         updateTouch();
     }
 }
