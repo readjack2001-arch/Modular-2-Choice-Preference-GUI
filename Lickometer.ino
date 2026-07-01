@@ -20,7 +20,6 @@
 #define DRY_3  6
 #define PDWN 7
 #define RESET 0
-#define readFlush() do { while (Serial.available() > 0) Serial.read(); } while (0)
 
 
 
@@ -88,6 +87,44 @@ void helpSumary() {
   "\tSend h <enter> to print this again\n" \
   "---------------------------------------------------------------------------------------")); 
 } 
+
+
+
+void readFlush() {
+    while (Serial.available()) {
+        Serial.read();
+    }
+}
+
+int readLine(char *buffer, int maxLen)
+{
+    int len = 0;
+
+    while (true)
+    {
+        while (!Serial.available()) {}
+
+        char c = Serial.read();
+
+        if (c == '\r' || c == '\n')
+        {
+            while (Serial.available())
+            {
+                char next = Serial.peek();
+                if (next == '\r' || next == '\n')
+                    Serial.read();
+                else
+                    break;
+            }
+
+            buffer[len] = '\0';
+            return len;
+        }
+
+        if (len < maxLen - 1)
+            buffer[len++] = c;
+    }
+}
 
 
 void setup()
@@ -241,8 +278,7 @@ void loop()
           break;
       case 'i':  //change or report interval time in seconds
             delay(10);  //wait to receive second char in serial
-            ch = Serial.readBytesUntil('\r', cmd, 6); //receive command
-            cmd[ch] = '\0';  //terminate las in array position 6 if 5 chars came in 
+            ch = readLine(cmd, sizeof(cmd)); //receive command  //terminate las in array position 6 if 5 chars came in 
             if (ch == 0) { //Just enter so report back
                 Serial.print("Current interval in seconds is: ");
                 Serial.println(interval);
@@ -346,8 +382,7 @@ void loop()
           Serial.println("Now enter value from 20 to 255, default was 130, or just enter to cancel");
           i2cMux[ch >> 1].setChannel(CHAN_NONE); //De-activate I2C to current touch sensor
           while (!Serial.available()) {}
-          cmdLen = Serial.readBytesUntil('\r', cmd, 4); //receive command
-          cmd[cmdLen] = '\0';  //terminate las in array position 4 if 3 chars came in 
+          cmdLen = readLine(cmd, sizeof(cmd)); //receive command  //terminate las in array position 4 if 3 chars came in 
           if (cmdLen >0) { //Just enter so report back
               if (atoi(cmd) < 10 || atoi(cmd) > 255 || Serial.available()) {  //If out of range or more digits than 3
                   Serial.println("Wrong Threshold, min is 10, max 255, try again");
